@@ -297,6 +297,12 @@ export interface LlmMetrics {
   uncachedPrefillTps?: number | null;
   /** Cumulative total output (generation) tokens as reported by the LLM server */
   totalOutputTokens: number;
+  /** Cumulative total prefill (input) tokens as reported by the LLM server */
+  totalPrefillTokens: number;
+  /** Cumulative cached-prefill tokens (split backends); null when the split is unknown. */
+  totalCachedPrefillTokens?: number | null;
+  /** Cumulative uncached/computed prefill tokens (split backends); null when the split is unknown. */
+  totalUncachedPrefillTokens?: number | null;
   /** vLLM KV cache usage fraction (0–1). null when backend !== vllm or unreachable. */
   kvCacheUsage?: number | null;
   /** vLLM running request count. null when unavailable. */
@@ -335,6 +341,14 @@ export interface LlmDailyDay {
   cachedPrefillAvg: number | null;
   uncachedPrefillMax: number | null;
   uncachedPrefillAvg: number | null;
+  /** Daily decode tokens (sum of cumulative-counter deltas). */
+  decodeTokens: number;
+  /** Daily prefill tokens (sum of cumulative-counter deltas). */
+  prefillTokens: number;
+  /** Daily cached-prefill tokens; null when the split is unavailable. */
+  cachedPrefillTokens: number | null;
+  /** Daily uncached-prefill tokens; null when the split is unavailable. */
+  uncachedPrefillTokens: number | null;
 }
 
 export interface LlmDailyResponse {

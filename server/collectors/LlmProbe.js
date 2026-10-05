@@ -95,6 +95,12 @@ export class LlmProbe {
 
     // Cumulative total output tokens (generation) as reported by the LLM server
     this.totalOutputTokens = 0;
+    // Cumulative total prefill (input) tokens as reported by the LLM server
+    this.totalPrefillTokens = 0;
+    /** Cumulative cached-prefill tokens (split backends); null when the split is unknown. */
+    this.totalCachedPrefillTokens = null;
+    /** Cumulative uncached/computed prefill tokens (split backends); null when the split is unknown. */
+    this.totalUncachedPrefillTokens = null;
 
     // vLLM inference metrics from /metrics (null when not vLLM / missing series)
     // Metric names follow stock vLLM Prometheus exposition (versions may differ).
@@ -142,11 +148,15 @@ export class LlmProbe {
       this.cachedPrefillTps = null;
       this.uncachedPrefillTps = null;
       this.lastPrefillKinds = null;
+      this.totalCachedPrefillTokens = null;
+      this.totalUncachedPrefillTokens = null;
       return;
     }
     const total = cachedCount + computedCount;
     this.prefixCacheHitRate =
       total > 0 ? Math.round((cachedCount / total) * 10000) / 10000 : null;
+    this.totalCachedPrefillTokens = cachedCount;
+    this.totalUncachedPrefillTokens = computedCount;
     if (this.lastPrefillKinds == null) {
       this.lastPrefillKinds = { cached: cachedCount, computed: computedCount };
       this.cachedPrefillTps = 0;
@@ -235,6 +245,9 @@ export class LlmProbe {
     this.slotsActive = 0;
     this.slotsTotal = 0;
     this.totalOutputTokens = 0;
+    this.totalPrefillTokens = 0;
+    this.totalCachedPrefillTokens = null;
+    this.totalUncachedPrefillTokens = null;
     this.kvCacheUsage = null;
     this.requestsRunning = null;
     this.requestsWaiting = null;
@@ -496,7 +509,10 @@ export class LlmProbe {
         this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
         if (!inflight && deltaOut <= 0) this.prefillTps = 0;
       }
-      if (prefilled != null) this.lastTokenCounts.input = prefilled;
+      if (prefilled != null) {
+        this.lastTokenCounts.input = prefilled;
+        this.totalPrefillTokens = prefilled;
+      }
       this.lastTokenCounts.output = decoded;
       this.totalOutputTokens = decoded;
     } else {
@@ -567,6 +583,7 @@ export class LlmProbe {
       this.lastTokenCounts.input = promptTokens;
       this.lastTokenCounts.output = genTokens;
       this.totalOutputTokens = genTokens;
+      this.totalPrefillTokens = promptTokens;
       const ttftSum = this._getVllmMetric(txt, "time_to_first_token_seconds_sum");
       const deltaIter =
         iterSum != null && this.lastIterSum != null ? iterSum - this.lastIterSum : 0;
@@ -627,6 +644,18 @@ export class LlmProbe {
         ? Math.round((prefixHits / prefixQueries) * 10000) / 10000
         : null;
 
+    // vLLM does not expose a cached/uncached prefill token split directly.
+    // Estimate it from the cumulative prefix-cache hit rate: hits ≈ prompt
+    // tokens served from cache, the rest were computed on GPU.
+    if (this.prefixCacheHitRate != null && promptTokens != null) {
+      const cachedEst = Math.round(promptTokens * this.prefixCacheHitRate);
+      this.totalCachedPrefillTokens = cachedEst;
+      this.totalUncachedPrefillTokens = Math.max(0, promptTokens - cachedEst);
+    } else {
+      this.totalCachedPrefillTokens = null;
+      this.totalUncachedPrefillTokens = null;
+    }
+
     const mtpAccepted = this._getVllmMetric(txt, "spec_decode_num_accepted_tokens_total");
     const mtpDrafted = this._getVllmMetric(txt, "spec_decode_num_draft_tokens_total");
     this.mtpAcceptanceRate =
@@ -680,6 +709,7 @@ export class LlmProbe {
         this.lastTokenCounts.input = input;
         this.lastTokenCounts.output = output;
         this.totalOutputTokens = output;
+        this.totalPrefillTokens = input;
         if (dtSec > 0 && dtSec < 10) {
           this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
           this._setPrefillTps(deltaIn / dtSec, deltaOut > 0);
@@ -790,6 +820,7 @@ export class LlmProbe {
         const deltaIn = prompt - this.lastTokenCounts.input;
         this._setPrefillTps(deltaIn / dtSec, deltaOut > 0);
         this.lastTokenCounts.input = prompt;
+        this.totalPrefillTokens = prompt;
       } else if (deltaOut <= 0) {
         this.prefillTps = 0;
       }
@@ -820,6 +851,7 @@ export class LlmProbe {
       this._getPromMetric(txt, "sglang:prompt_tokens_total") ??
       this._getPromMetric(txt, "sglang_prompt_tokens_total");
     const cached = this._sglangCachedTokens(txt);
+    if (prompt != null) this.totalPrefillTokens = prompt;
     if (cached != null && prompt != null) {
       this._setPrefillSplitRates(cached, prompt, dtSec);
     }
@@ -902,6 +934,7 @@ export class LlmProbe {
           }
 
           this.totalOutputTokens = totalDecoded;
+          this.totalPrefillTokens = promptedSum;
           this.generationTps = Math.max(0, Math.round(totalGen * 100) / 100);
           this._setPrefillTps(totalPrefill, totalGen > 0);
           if (sawCache) this._setPrefillSplitRates(cachedSum, promptedSum, dtSec);
@@ -1166,6 +1199,9 @@ export class LlmProbe {
       cachedPrefillTps: this.cachedPrefillTps,
       uncachedPrefillTps: this.uncachedPrefillTps,
       totalOutputTokens: this.totalOutputTokens,
+      totalPrefillTokens: this.totalPrefillTokens,
+      totalCachedPrefillTokens: this.totalCachedPrefillTokens,
+      totalUncachedPrefillTokens: this.totalUncachedPrefillTokens,
       kvCacheUsage: this.kvCacheUsage,
       requestsRunning: this.requestsRunning,
       requestsWaiting: this.requestsWaiting,
@@ -1195,6 +1231,9 @@ export class LlmProbe {
       cachedPrefillTps: null,
       uncachedPrefillTps: null,
       totalOutputTokens: 0,
+      totalPrefillTokens: 0,
+      totalCachedPrefillTokens: null,
+      totalUncachedPrefillTokens: null,
       kvCacheUsage: null,
       requestsRunning: null,
       requestsWaiting: null,

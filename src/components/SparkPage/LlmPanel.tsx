@@ -7,6 +7,7 @@ import { BotIcon, GearIcon, InfoIcon } from "../ui/icons";
 import { useMetricsHistoryTail } from "../../hooks/metricsStore";
 import { BenchmarkDialog } from "./BenchmarkDialog";
 import { LlmDailyChart } from "./LlmDailyChart";
+import { LlmPrefillPanel } from "./LlmPrefillPanel";
 
 interface LlmPanelProps {
   llm: LlmMetrics | null;
@@ -575,6 +576,8 @@ export function LlmPanel({
               </div>
             </div>
           </div>
+
+          <LlmPrefillPanel llm={llm} sparkId={sparkId} llmPort={llmPort} />
 
           {llm?.backend === "vllm" && (
             <div className="grid grid-cols-2 gap-2 border-t border-border pt-3 sm:grid-cols-4">

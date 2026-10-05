@@ -38,6 +38,11 @@ function emptyDay() {
     uncachedPrefillSum: 0,
     uncachedPrefillN: 0,
     hasSplit: false,
+    // Daily cumulative token totals (deltas of the probe's counters)
+    decodeTokens: 0,
+    prefillTokens: 0,
+    cachedPrefillTokens: 0,
+    uncachedPrefillTokens: 0,
   };
 }
 
@@ -67,6 +72,10 @@ function publicDay(date, day) {
       cachedPrefillAvg: null,
       uncachedPrefillMax: null,
       uncachedPrefillAvg: null,
+      decodeTokens: 0,
+      prefillTokens: 0,
+      cachedPrefillTokens: null,
+      uncachedPrefillTokens: null,
     };
   }
   const split = Boolean(day.hasSplit);
@@ -80,6 +89,10 @@ function publicDay(date, day) {
     cachedPrefillAvg: split ? avg(day.cachedPrefillSum, day.cachedPrefillN) : null,
     uncachedPrefillMax: split ? round2(day.uncachedPrefillMax || 0) : null,
     uncachedPrefillAvg: split ? avg(day.uncachedPrefillSum, day.uncachedPrefillN) : null,
+    decodeTokens: round2(day.decodeTokens || 0),
+    prefillTokens: round2(day.prefillTokens || 0),
+    cachedPrefillTokens: split ? round2(day.cachedPrefillTokens || 0) : null,
+    uncachedPrefillTokens: split ? round2(day.uncachedPrefillTokens || 0) : null,
   };
 }
 
@@ -104,6 +117,8 @@ export class LlmDailyStore {
     this._data = {};
     this._dirty = false;
     this._flushTimer = null;
+    /** Last-seen cumulative token counters per series (for per-day deltas). */
+    this._lastTokens = {};
     this._load();
   }
 
@@ -139,7 +154,7 @@ export class LlmDailyStore {
   /**
    * @param {string} sparkId
    * @param {number} port
-   * @param {{ available?: boolean, generationTps?: number, prefillTps?: number, cachedPrefillTps?: number|null, uncachedPrefillTps?: number|null }} metrics
+   * @param {{ available?: boolean, generationTps?: number, prefillTps?: number, cachedPrefillTps?: number|null, uncachedPrefillTps?: number|null, totalOutputTokens?: number, totalPrefillTokens?: number, totalCachedPrefillTokens?: number|null, totalUncachedPrefillTokens?: number|null }} metrics
    * @param {Date} [now]
    */
   record(sparkId, port, metrics, now = new Date()) {
@@ -163,11 +178,64 @@ export class LlmDailyStore {
       changed = ingest(day, "cachedPrefill", metrics.cachedPrefillTps) || changed;
       changed = ingest(day, "uncachedPrefill", metrics.uncachedPrefillTps) || changed;
     }
+    const hasTokenSplit =
+      metrics.totalCachedPrefillTokens != null || metrics.totalUncachedPrefillTokens != null;
+    if (hasTokenSplit && !day.hasSplit) {
+      day.hasSplit = true;
+      changed = true;
+    }
+    if (this._ingestTokenTotals(key, date, day, metrics)) changed = true;
 
     if (!changed) return;
     this._data[key] = pruneSeries(this._data[key]);
     this._dirty = true;
     this._scheduleFlush();
+  }
+
+  /**
+   * Accumulate per-day cumulative token totals (decode / prefill / cached+uncached
+   * split) from deltas of the probe's counters. Reseeds across day boundaries so
+   * tokens are attributed to the UTC day they were produced in; a gap/restart also
+   * reseeds (no cross-gap attribution). Split fields may be null when the backend
+   * does not report them.
+   * @param {string} key
+   * @param {string} date
+   * @param {ReturnType<typeof emptyDay>} day
+   * @param {{ totalOutputTokens?: number, totalPrefillTokens?: number, totalCachedPrefillTokens?: number|null, totalUncachedPrefillTokens?: number|null }} metrics
+   * @returns {boolean} true when any tokens were added
+   */
+  _ingestTokenTotals(key, date, day, metrics) {
+    const cur = {
+      out: metrics.totalOutputTokens,
+      pref: metrics.totalPrefillTokens,
+      cached: metrics.totalCachedPrefillTokens,
+      uncached: metrics.totalUncachedPrefillTokens,
+    };
+    const last = this._lastTokens[key];
+    if (
+      last == null ||
+      last.date !== date ||
+      !Number.isFinite(cur.out) ||
+      !Number.isFinite(cur.pref)
+    ) {
+      this._lastTokens[key] = { date, ...cur };
+      return false;
+    }
+    let changed = false;
+    const acc = (target, curV, lastV) => {
+      if (curV == null || lastV == null || !Number.isFinite(curV)) return;
+      const d = curV - lastV;
+      if (d > 0) {
+        day[target] = round2((day[target] || 0) + d);
+        changed = true;
+      }
+    };
+    acc("decodeTokens", cur.out, last.out);
+    acc("prefillTokens", cur.pref, last.pref);
+    acc("cachedPrefillTokens", cur.cached, last.cached);
+    acc("uncachedPrefillTokens", cur.uncached, last.uncached);
+    this._lastTokens[key] = { date, ...cur };
+    return changed;
   }
 
   /**
