@@ -27,6 +27,20 @@ const POLL_PRESETS = [
   { label: "10s", value: 10000 },
 ];
 
+const TZ_PRESETS = [
+  { label: "UTC−8", value: -480 },
+  { label: "UTC−5", value: -300 },
+  { label: "UTC+0", value: 0 },
+  { label: "UTC+1", value: 60 },
+  { label: "UTC+3", value: 180 },
+  { label: "UTC+5:30", value: 330 },
+  { label: "UTC+7", value: 420 },
+  { label: "UTC+8 (Beijing)", value: 480 },
+  { label: "UTC+9", value: 540 },
+  { label: "UTC+10", value: 600 },
+  { label: "UTC+12", value: 720 },
+];
+
 export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [loading, setLoading] = useState(false);
@@ -139,6 +153,26 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
               />
               <p className="mt-1 text-[10px] text-muted">
                 Pre-filled when adding a new Spark (1–65535)
+              </p>
+            </div>
+
+            {/* Usage history timezone */}
+            <div>
+              <label className="mb-1 block text-xs text-muted">Usage history timezone</label>
+              <select
+                value={settings.llmHistoryTzOffsetMinutes}
+                onChange={(e) => update({ llmHistoryTzOffsetMinutes: Number(e.target.value) })}
+                className="w-full rounded border border-border bg-surface-elevated px-3 py-1.5 text-xs text-text outline-none focus:border-accent"
+              >
+                {TZ_PRESETS.map((tz) => (
+                  <option key={tz.value} value={tz.value}>
+                    {tz.label}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-[10px] text-muted">
+                Day boundary for token usage history. Tokens are stored hourly, so the
+                Cost estimate dialog can still view any timezone.
               </p>
             </div>
 

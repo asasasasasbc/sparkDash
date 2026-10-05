@@ -357,6 +357,25 @@ export interface LlmDailyResponse {
   days: LlmDailyDay[];
 }
 
+/** One hourly token bucket. `hour` is a UTC hour key ("YYYY-MM-DDTHH"). */
+export interface LlmHourlyBucket {
+  hour: string;
+  decode: number;
+  prefill: number;
+  /** Cached-prefill tokens; null when the backend does not split the prefill count. */
+  cached: number | null;
+  /** Uncached-prefill tokens; null when the backend does not split the prefill count. */
+  uncached: number | null;
+  /** True when the cached/uncached split is available for this hour. */
+  split: boolean;
+}
+
+export interface LlmHourlyResponse {
+  sparkId: string;
+  port: number;
+  hours: LlmHourlyBucket[];
+}
+
 /** Security posture badge payload from LlmProbe. */
 export interface LlmPosture {
   /** ok = green, warn = amber, danger = red */
@@ -537,6 +556,8 @@ export interface Settings {
   benchDebugTraces: boolean;
   /** Layout density — compact (default) or comfortable. */
   density: "comfortable" | "compact";
+  /** Timezone offset (minutes east of UTC) for LLM usage history days. Default 480 (UTC+8). */
+  llmHistoryTzOffsetMinutes: number;
 }
 
 export interface SparksListResponse {

@@ -19,6 +19,12 @@ const DEFAULTS = Object.freeze({
   benchDebugTraces: false,
   /** Layout density — compact (default) or comfortable. */
   density: "compact",
+  /**
+   * Timezone offset (minutes east of UTC) used to bucket LLM usage history into
+   * local days. Default 480 = UTC+8. Token data is stored hourly in UTC, so the
+   * frontend can still re-slice it at a different offset.
+   */
+  llmHistoryTzOffsetMinutes: 480,
 });
 
 /** @type {typeof DEFAULTS} */
@@ -45,6 +51,13 @@ function _clampSettings(settings) {
   // Ensure density is valid
   if (s.density !== "comfortable" && s.density !== "compact") {
     s.density = DEFAULTS.density;
+  }
+  // Clamp LLM history timezone offset to a sane range (UTC-12 … UTC+14)
+  const tz = Number(s.llmHistoryTzOffsetMinutes);
+  if (!Number.isFinite(tz)) {
+    s.llmHistoryTzOffsetMinutes = DEFAULTS.llmHistoryTzOffsetMinutes;
+  } else {
+    s.llmHistoryTzOffsetMinutes = Math.max(-720, Math.min(840, Math.round(tz)));
   }
   return s;
 }

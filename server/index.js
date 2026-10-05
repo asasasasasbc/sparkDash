@@ -756,7 +756,9 @@ app.put("/api/sparks/:id/llm-ports/:port/api-key", (req, res) => {
 
 /**
  * Daily decode / prefill tok/s rollups + per-day token totals (busy samples).
- * Query: port (required for multi-port), days (1–3660; 0 = full stored history).
+ * Token totals are aggregated into the configured local day (settings
+ * llmHistoryTzOffsetMinutes). Query: port (required for multi-port),
+ * days (1–3660; 0 = full stored history).
  */
 app.get("/api/sparks/:id/llm/daily", (req, res) => {
   const spark = registry.getSpark(req.params.id);
@@ -772,6 +774,27 @@ app.get("/api/sparks/:id/llm/daily", (req, res) => {
   let days = req.query.days != null ? Number(req.query.days) : 14;
   if (!Number.isFinite(days)) days = 14;
   res.json(llmDaily.getSeries(spark.id, port, { days }));
+});
+
+/**
+ * Sparse hourly token buckets with UTC hour keys ("YYYY-MM-DDTHH"), so the client
+ * can slice usage into any timezone. Query: port (required for multi-port),
+ * days (1–3660; 0 = full stored history).
+ */
+app.get("/api/sparks/:id/llm/hourly", (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  const ports =
+    Array.isArray(spark.llmPorts) && spark.llmPorts.length
+      ? spark.llmPorts
+      : [resolveLlmPort(spark)];
+  let port = req.query.port != null ? Number(req.query.port) : ports[0];
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return res.status(400).json({ error: "Invalid port" });
+  }
+  let days = req.query.days != null ? Number(req.query.days) : 30;
+  if (!Number.isFinite(days)) days = 30;
+  res.json(llmDaily.getHourly(spark.id, port, { days }));
 });
 
 /**
