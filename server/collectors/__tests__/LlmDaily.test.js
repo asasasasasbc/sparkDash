@@ -116,3 +116,36 @@ test("LlmDailyStore: token totals reseed across a day boundary", () => {
   assert.equal(days[1].date, "2026-08-17");
   assert.equal(days[1].decodeTokens, 0);
 });
+
+test("LlmDailyStore: keeps history older than 30 days", () => {
+  const store = tmpStore();
+  const old = new Date("2026-01-05T12:00:00.000Z");
+  const now = new Date("2026-08-16T12:00:00.000Z");
+  store.record("spark-a", 8888, { available: true, generationTps: 10, prefillTps: 40 }, old);
+  store.record("spark-a", 8888, { available: true, generationTps: 20, prefillTps: 50 }, now);
+  const { days } = store.getSeries("spark-a", 8888, { days: 365, now });
+  const jan = days.find((d) => d.date === "2026-01-05");
+  assert.ok(jan, "January sample should be retained past the old 30-day cap");
+  assert.equal(jan.decodeMax, 10);
+});
+
+test("LlmDailyStore: days=0 returns the full stored history", () => {
+  const store = tmpStore();
+  const old = new Date("2026-08-10T12:00:00.000Z");
+  const now = new Date("2026-08-16T12:00:00.000Z");
+  store.record("spark-a", 8888, { available: true, generationTps: 11, prefillTps: 41 }, old);
+  store.record("spark-a", 8888, { available: true, generationTps: 22, prefillTps: 42 }, now);
+  const { days } = store.getSeries("spark-a", 8888, { days: 0, now });
+  assert.equal(days.length, 7);
+  assert.equal(days[0].date, "2026-08-10");
+  assert.equal(days[days.length - 1].date, "2026-08-16");
+});
+
+test("LlmDailyStore: days=0 with no data returns an empty series", () => {
+  const store = tmpStore();
+  const { days } = store.getSeries("spark-a", 8888, {
+    days: 0,
+    now: new Date("2026-08-16T12:00:00.000Z"),
+  });
+  assert.equal(days.length, 0);
+});

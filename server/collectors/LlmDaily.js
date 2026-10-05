@@ -1,13 +1,22 @@
 /**
- * Daily LLM tok/s rollups (decode + prefill, plus cached/uncached when the backend splits).
+ * Daily LLM tok/s rollups (decode + prefill, plus cached/uncached when the backend splits)
+ * and per-day token totals.
  *
- * Busy samples only (rate > 0). Persists to config/llm-daily.json, last 30 UTC days.
+ * Busy samples only (rate > 0). Persists to config/llm-daily.json. History is retained
+ * permanently by default so token consumption can be audited over any date range; set
+ * SPARKDASH_LLM_DAILY_RETENTION_DAYS to a positive integer to cap each series.
  */
 import fs from "fs";
 import { LLM_DAILY_JSON_PATH } from "../config.js";
 import { atomicWrite } from "../util/atomicWrite.js";
 
-const MAX_DAYS = 30;
+/** Days of history to keep per series. 0 (default) = keep everything. */
+const RETENTION_DAYS = Math.max(
+  0,
+  Math.floor(Number(process.env.SPARKDASH_LLM_DAILY_RETENTION_DAYS) || 0)
+);
+/** Upper bound for one calendar query, so a bad client cannot ask for unbounded arrays. */
+const MAX_QUERY_DAYS = 3660;
 const FLUSH_MS = 30_000;
 const BUSY_EPS = 0.05;
 
@@ -97,9 +106,10 @@ function publicDay(date, day) {
 }
 
 function pruneSeries(daysByDate) {
+  if (RETENTION_DAYS <= 0) return daysByDate;
   const keys = Object.keys(daysByDate).sort();
-  if (keys.length <= MAX_DAYS) return daysByDate;
-  const keep = new Set(keys.slice(-MAX_DAYS));
+  if (keys.length <= RETENTION_DAYS) return daysByDate;
+  const keep = new Set(keys.slice(-RETENTION_DAYS));
   const next = {};
   for (const k of keys) {
     if (keep.has(k)) next[k] = daysByDate[k];
@@ -239,16 +249,30 @@ export class LlmDailyStore {
   }
 
   /**
-   * Calendar-aligned last `days` UTC dates (zeros for missing).
+   * Calendar-aligned UTC day series (zeros for missing days). `days` defaults to 14.
+   * Pass 0 (or any non-positive / non-finite value) to return the full stored history,
+   * capped at MAX_QUERY_DAYS. Returns an empty array when nothing is stored.
    * @param {string} sparkId
    * @param {number} port
    * @param {{ days?: number, now?: Date }} [opts]
    */
   getSeries(sparkId, port, opts = {}) {
-    const n = Math.min(MAX_DAYS, Math.max(1, Number(opts.days) || 14));
     const now = opts.now instanceof Date ? opts.now : new Date();
     const key = seriesKey(sparkId, port);
     const stored = this._data[key] || {};
+    const requested = opts.days == null ? 14 : Number(opts.days);
+    let n;
+    if (Number.isFinite(requested) && requested > 0) {
+      n = Math.min(MAX_QUERY_DAYS, Math.floor(requested));
+    } else {
+      // "all": span from the earliest stored day through today.
+      const earliest = Object.keys(stored).sort()[0];
+      if (!earliest) return { sparkId, port, days: [] };
+      const from = Date.parse(`${earliest}T00:00:00.000Z`);
+      if (!Number.isFinite(from)) return { sparkId, port, days: [] };
+      const span = Math.floor((now.getTime() - from) / 86400000) + 1;
+      n = Math.max(1, Math.min(MAX_QUERY_DAYS, span));
+    }
     const out = [];
     for (let i = n - 1; i >= 0; i--) {
       const d = new Date(now.getTime() - i * 86400000);

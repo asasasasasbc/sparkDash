@@ -755,8 +755,8 @@ app.put("/api/sparks/:id/llm-ports/:port/api-key", (req, res) => {
 });
 
 /**
- * Daily decode / prefill tok/s rollups (busy samples, last 14 UTC days by default).
- * Query: port (required for multi-port), days (1–30).
+ * Daily decode / prefill tok/s rollups + per-day token totals (busy samples).
+ * Query: port (required for multi-port), days (1–3660; 0 = full stored history).
  */
 app.get("/api/sparks/:id/llm/daily", (req, res) => {
   const spark = registry.getSpark(req.params.id);

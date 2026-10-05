@@ -71,7 +71,7 @@ function formatAxis(n: number): string {
   return Math.round(n).toString();
 }
 
-type RangePreset = "today" | "7d" | "30d" | "custom";
+type RangePreset = "today" | "7d" | "30d" | "90d" | "180d" | "365d" | "custom";
 
 function tokenParts(day: LlmDailyDay, normalizeVllmSplit: boolean) {
   let cached = day.cachedPrefillTokens || 0;
@@ -95,7 +95,8 @@ function UsageChart({
   prices: LlmPrices;
   normalizeVllmSplit: boolean;
 }) {
-  const width = Math.max(760, days.length * 30);
+  const slotPx = days.length > 200 ? 6 : days.length > 90 ? 10 : 30;
+  const width = Math.max(760, days.length * slotPx);
   const height = 300;
   const plot = { left: 62, right: 18, top: 18, bottom: 42 };
   const plotW = width - plot.left - plot.right;
@@ -103,8 +104,9 @@ function UsageChart({
   const totals = days.map((day) => tokenParts(day, normalizeVllmSplit));
   const max = Math.max(1, ...totals.map((item) => item.total));
   const slot = plotW / Math.max(1, days.length);
-  const barW = Math.min(28, Math.max(8, slot * 0.58));
-  const labelEvery = days.length > 20 ? 3 : days.length > 10 ? 2 : 1;
+  const barW = Math.max(3, Math.min(28, slot * 0.6));
+  const labelEvery =
+    days.length <= 10 ? 1 : days.length <= 35 ? 2 : days.length <= 100 ? 7 : days.length <= 200 ? 14 : 30;
 
   if (!totals.some((item) => item.total > 0)) {
     return (
@@ -231,7 +233,9 @@ export function CostEstimateDialog({
     let cancelled = false;
     const load = () => {
       setLoading(true);
-      fetchLlmDaily(sparkId, llmPort, 30)
+      // days=0 requests the full stored history so the date picker and long
+      // presets (90/180/365d) can reach beyond the old 30-day window.
+      fetchLlmDaily(sparkId, llmPort, 0)
         .then((res) => {
           if (cancelled) return;
           const next = res.days || [];
@@ -271,7 +275,10 @@ export function CostEstimateDialog({
   const selectedDays = useMemo(() => {
     if (range === "today") return days.slice(-1);
     if (range === "7d") return days.slice(-7);
-    if (range === "30d") return days;
+    if (range === "30d") return days.slice(-30);
+    if (range === "90d") return days.slice(-90);
+    if (range === "180d") return days.slice(-180);
+    if (range === "365d") return days.slice(-365);
     return days.filter(
       (day) => (!startDate || day.date >= startDate) && (!endDate || day.date <= endDate)
     );
@@ -349,6 +356,9 @@ export function CostEstimateDialog({
               ["today", "Today"],
               ["7d", "Last 7 days"],
               ["30d", "Last 30 days"],
+              ["90d", "Last 90 days"],
+              ["180d", "Last 180 days"],
+              ["365d", "Last 365 days"],
             ] as const).map(([value, label]) => (
               <button
                 key={value}
@@ -476,7 +486,7 @@ export function CostEstimateDialog({
         </div>
 
         <div className="modal-sheet__footer">
-          <p className="text-[10px] text-muted">Usage is retained for the latest 30 UTC days. No points or credits are calculated.</p>
+          <p className="text-[10px] text-muted">Usage history is retained indefinitely. No points or credits are calculated.</p>
           <button
             type="button"
             onClick={onClose}
