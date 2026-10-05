@@ -12,8 +12,10 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { atomicWrite } from "../util/atomicWrite.js";
 import { decodeBenchManager } from "./DecodeBench.js";
+import { prefillBenchManager } from "./PrefillBench.js";
 import {
   applyThinkingFlags,
+  coerceThinkingFlag,
   pollServerGenerationRates,
   round2,
   runStreamingRequest,
@@ -114,7 +116,7 @@ function publicSessionRecord(session, opts = {}) {
     modelId: session.modelId ?? null,
     maxTokens: session.maxTokens ?? null,
     temperature: session.temperature ?? DEFAULT_TEMPERATURE,
-    thinking: session.thinking !== false,
+    thinking: coerceThinkingFlag(session.thinking),
     promptType: session.promptType ?? null,
     startedAt: session.startedAt ?? null,
     completedAt: session.completedAt ?? null,
@@ -141,7 +143,7 @@ function historySummary(record) {
     modelId: record.modelId ?? null,
     maxTokens: record.maxTokens ?? null,
     temperature: record.temperature ?? DEFAULT_TEMPERATURE,
-    thinking: record.thinking !== false,
+    thinking: coerceThinkingFlag(record.thinking),
     promptType: record.promptType ?? null,
     startedAt: record.startedAt ?? null,
     completedAt: record.completedAt ?? null,
@@ -323,6 +325,11 @@ export class ShowcaseManager {
       err.status = 409;
       throw err;
     }
+    if (prefillBenchManager.getActive(sparkId)) {
+      const err = new Error("A prefill benchmark is already running for this Spark");
+      err.status = 409;
+      throw err;
+    }
 
     const prompts = normalizePrompts(rawPrompts);
     if (!prompts) {
@@ -363,7 +370,7 @@ export class ShowcaseManager {
       throw err;
     }
 
-    const thinking = rawThinking !== false;
+    const thinking = coerceThinkingFlag(rawThinking);
     const promptType =
       typeof rawPromptType === "string" && PROMPT_TYPES.has(rawPromptType)
         ? rawPromptType
@@ -522,7 +529,7 @@ export class ShowcaseManager {
       modelId: session.modelId,
       maxTokens: session.maxTokens,
       temperature: session.temperature,
-      thinking: session.thinking !== false,
+      thinking: coerceThinkingFlag(session.thinking),
       startedAt: session.startedAt,
       completedAt: session.completedAt,
       serverGenerationTps: session.serverGenerationTps,
@@ -692,7 +699,7 @@ export class ShowcaseManager {
         stream: true,
         stream_options: { include_usage: true },
       };
-      applyThinkingFlags(body, session.modelId, session.thinking !== false);
+      applyThinkingFlags(body, session.modelId, session.thinking);
 
       stream.status = "streaming";
       stream._t0 = performance.now();
@@ -703,6 +710,7 @@ export class ShowcaseManager {
       return runStreamingRequest(url, body, ctrl.signal, {
         collectContent: true,
         retryOnThinking400: true,
+        thinking: session.thinking,
         apiKey: session._apiKey,
         onDelta: (info) => {
           if (session.status !== "running") return;
@@ -729,6 +737,7 @@ export class ShowcaseManager {
               {
                 collectContent: true,
                 retryOnThinking400: true,
+                thinking: session.thinking,
                 apiKey: session._apiKey,
                 onDelta: (info) => {
                   if (session.status !== "running") return;

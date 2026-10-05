@@ -66,9 +66,8 @@ test("LlmDailyStore: cumulative token totals roll into per-day deltas", () => {
     generationTps: 10,
     prefillTps: 40,
     totalOutputTokens: 1000,
-    totalPrefillTokens: 2000,
-    totalCachedPrefillTokens: 800,
-    totalUncachedPrefillTokens: 1200,
+    totalPromptTokens: 2000,
+    totalCachedTokens: 800,
   };
   store.record("spark-a", 8888, base, now);
   store.record(
@@ -79,9 +78,8 @@ test("LlmDailyStore: cumulative token totals roll into per-day deltas", () => {
       generationTps: 15,
       prefillTps: 50,
       totalOutputTokens: 1120,
-      totalPrefillTokens: 2210,
-      totalCachedPrefillTokens: 850,
-      totalUncachedPrefillTokens: 1360,
+      totalPromptTokens: 2210,
+      totalCachedTokens: 850,
     },
     now
   );
@@ -101,7 +99,7 @@ test("LlmDailyStore: a long gap reseeds instead of attributing the jump", () => 
     generationTps: 10,
     prefillTps: 40,
     totalOutputTokens: out,
-    totalPrefillTokens: pref,
+    totalPromptTokens: pref,
   });
   store.record("spark-a", 8888, mk(1000, 2000), day1);
   store.record("spark-a", 8888, mk(1100, 2100), day1);
@@ -125,7 +123,7 @@ test("LlmDailyStore: hourly buckets are timezone-sliceable", () => {
     generationTps: 10,
     prefillTps: 40,
     totalOutputTokens: out,
-    totalPrefillTokens: out * 2,
+    totalPromptTokens: out * 2,
   });
   // 15:5x UTC = 23:5x on Aug 16 at UTC+8; 16:0x UTC = 00:0x on Aug 17 at UTC+8.
   store.record("spark-a", 8888, mk(1000), new Date("2026-08-16T15:50:00.000Z"));
@@ -149,13 +147,13 @@ test("LlmDailyStore: getHourly returns sparse UTC buckets", () => {
   store.record(
     "spark-a",
     8888,
-    { available: true, generationTps: 5, prefillTps: 9, totalOutputTokens: 10, totalPrefillTokens: 20 },
+    { available: true, generationTps: 5, prefillTps: 9, totalOutputTokens: 10, totalPromptTokens: 20 },
     new Date("2026-08-16T15:00:00.000Z")
   );
   store.record(
     "spark-a",
     8888,
-    { available: true, generationTps: 5, prefillTps: 9, totalOutputTokens: 40, totalPrefillTokens: 80 },
+    { available: true, generationTps: 5, prefillTps: 9, totalOutputTokens: 40, totalPromptTokens: 80 },
     new Date("2026-08-16T15:05:00.000Z")
   );
   const { hours } = store.getHourly("spark-a", 8888, { days: 0 });

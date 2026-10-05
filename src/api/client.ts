@@ -1,6 +1,7 @@
 import type {
   DecodeBenchJob,
   DecodeBenchListResponse,
+  FleetEnergy,
   HermesBatchUpdateResponse,
   HermesUpdatesResponse,
   LlmMetrics,
@@ -14,9 +15,17 @@ import type {
   SparkConfig,
   SparkTestResponse,
   StartDecodeBenchRequest,
+  PrefillBenchJob,
+  PrefillBenchListResponse,
+  StartPrefillBenchRequest,
 } from "./types";
 
 const BASE = "";
+const TOKEN = (typeof localStorage !== "undefined" && localStorage.getItem("sparkdashToken")) || "";
+
+function authHeaders(): Record<string, string> {
+  return TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {};
+}
 
 // ─── Generic fetch wrapper ────────────────────────────────
 async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
@@ -27,7 +36,7 @@ async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
   if (opts?.body) headers["Content-Type"] = "application/json";
   const res = await fetch(`${BASE}${path}`, {
     ...opts,
-    headers: { ...headers, ...(opts?.headers as Record<string, string> | undefined) },
+    headers: { ...headers, ...authHeaders(), ...(opts?.headers as Record<string, string> | undefined) },
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
@@ -39,6 +48,10 @@ async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
 // ─── Sparks CRUD ─────────────────────────────────────────
 export function fetchSparks(): Promise<{ sparks: SparkConfig[] }> {
   return apiFetch("/api/sparks");
+}
+
+export function fetchFleetEnergy(): Promise<FleetEnergy> {
+  return apiFetch("/api/fleet-energy");
 }
 
 /** Latest metrics snapshot for one Spark (includes per-port LLM modelId). */
@@ -210,6 +223,51 @@ export function clearDecodeBenchHistory(
   const q =
     port != null && Number.isInteger(port) ? `?port=${encodeURIComponent(port)}` : "";
   return apiFetch(`/api/sparks/${id}/llm/bench${q}`, { method: "DELETE" });
+}
+
+// ─── LLM prefill benchmark ────────────────────────────
+export function startPrefillBench(
+  id: string,
+  body: StartPrefillBenchRequest
+): Promise<PrefillBenchJob> {
+  return apiFetch(`/api/sparks/${id}/llm/prefill-bench`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function getPrefillBench(
+  id: string,
+  benchId: string
+): Promise<PrefillBenchJob> {
+  return apiFetch(`/api/sparks/${id}/llm/prefill-bench/${benchId}`);
+}
+
+export function listPrefillBench(
+  id: string,
+  port?: number
+): Promise<PrefillBenchListResponse> {
+  const q =
+    port != null && Number.isInteger(port) ? `?port=${encodeURIComponent(port)}` : "";
+  return apiFetch(`/api/sparks/${id}/llm/prefill-bench${q}`);
+}
+
+export function cancelPrefillBench(
+  id: string,
+  benchId: string
+): Promise<PrefillBenchJob> {
+  return apiFetch(`/api/sparks/${id}/llm/prefill-bench/${benchId}`, {
+    method: "DELETE",
+  });
+}
+
+export function clearPrefillBenchHistory(
+  id: string,
+  port?: number
+): Promise<{ success: boolean }> {
+  const q =
+    port != null && Number.isInteger(port) ? `?port=${encodeURIComponent(port)}` : "";
+  return apiFetch(`/api/sparks/${id}/llm/prefill-bench${q}`, { method: "DELETE" });
 }
 
 // ─── LLM Prompt Showcase ──────────────────────────────

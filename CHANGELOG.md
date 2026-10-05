@@ -9,8 +9,97 @@ Format: version sections are listed newest first.
 
 ## [Unreleased]
 
+### Fixed
+- **Byte rates and memory sizes.** A transfer of 1023.95 KiB/s was labeled `1024.0 KB/s`, and 1023.5 MiB of RAM or VRAM was labeled `1024 MB` on the device panels and the Overview card. Both roll into the next unit: `1.0 MB/s` and `1.0 GB`. A 512 MB reading stays `512 MB`.
+- **Benchmark duration.** A run of 119.5 seconds was labeled `1m 60s` on the decode dialog, the prefill dialog, and the share card. It now reads `2m 0s`. 59.95 seconds was `60.0 s` and is now `1m 0s`. A 27.8 second run is unchanged.
+
+---
+
+## [1.8.9] — 2026-09-28
+
 ### Added
+- **Multi-GPU hosts** — a dedicated GPU host with several NVIDIA cards now reports every card: the header names them all (`NVIDIA GeForce RTX 5080 + RTX 5060 Ti`), the GPU panel adds a block per card, and the API exposes `gpu.gpus[]`. `metrics.gpu` keeps its shape as the all-cards aggregate, so single-GPU units, including every DGX Spark, are unchanged.
+- **TensorFold LLM backend** — detected from `/v1/models` (`owned_by: tensorfold`), labeled on the LLM card and Overview. Live tok/s reads cumulative token totals from `/health` when the server publishes them (TensorFold 0.5.0 CUDA does; older or MLX builds show 0 tok/s). Benches and showcase work as on any OpenAI-compatible server.
+- **Cached vs computed prefill in token totals** — the per-model token tables (node LLM panel + fleet Overview card) now split the prompt bucket into three columns: **Cached** (prefix-cache served), **Prefill** (computed = prompt − cached) and **Generated**. The probe exposes a new lifetime `totalCachedTokens` counter: vLLM `vllm:prefix_cache_hits_total` (token-granular), SGLang `total_cached_tokens` from `/server_info` or `sglang:cached_tokens_total{cache_source="device"}` from Prometheus, llama.cpp `n_prompt_tokens_cache` summed across slots, TensorFold `cached_tokens_total` from the CUDA server's `/health` (0.5.0+), and ds4/q27 computed+cached prefill counters (their raw prefill counter is computed-only, so the reported prompt is now the full prompt: computed + cached). EXL3 exposes no split — its cached column stays "—" and prefill equals prompt. The ledger clamps cached ≤ prompt on every credit, so backend backfills never inflate the cached share, and older ledger files upgrade transparently (cached starts at 0; the split begins at deployment, no retroactive history).
+- **LLM token totals per model** — sparkDash now keeps a durable ledger of cumulative prompt (prefill) and generated (completion) tokens, attributed to the model the server reported when the tokens were produced, across all supported LLM backends (vLLM, SGLang, ds4-server, q27, EXL3, llama.cpp). The node LLM panel gains a **Total tokens by model** block and Overview can show a fleet-wide **LLM Token Totals** card (Settings → *Show LLM Token Totals*, off by default), each with a time-range picker: All time, Today, Last 7 / 14 days, Last month (per-UTC-day buckets, 35-day retention; ranged views start at deployment — no retroactive history). Probes report the new lifetime `totalPromptTokens` counter alongside `totalOutputTokens` (null when a backend does not expose it). SGLang servers need `--enable-metrics` (or a build whose `/server_info` carries `total_input_tokens` / `total_output_tokens`) for SGLang-side counting to work. Counters accumulate saturatingly at `Number.MAX_SAFE_INTEGER` and survive engine restarts without double counting.
+- **Custom prefill size** — type any token count from 256–300k in the prefill benchmark (plus the preset chips).
+- **q27 LLM backend** — detect signalnine/q27 via `/v1/models` ownership or `q27_*` Prometheus series; report backend-aware decode/prefill rates and inference-health telemetry.
+- **Hide worker nodes** — Settings toggle. Worker-role Sparks drop off Overview cards and the tab bar (the open worker tab stays). Direct URLs and batch Wake / Shutdown / Hermes still include them.
+- **On-demand Remote bench** — a **Remote** button next to decode/prefill opens a host + port (HTTPS) field. Paste a Tailscale URL such as `https://name.ts.net/v1/models`; nothing is probed until you run Decode or Prefill against it.
+- **Decode / prefill benches on remote Sparks** — if the remote LLM is not reachable on its LAN IP (loopback-only bind), sparkDash opens an SSH local-forward to `127.0.0.1:<port>` for the job. Bench buttons stay on the LLM card even when the live probe shows no model.
+- **Benchmark share image** — the decode/prefill **Copy results** button is now a split button: the label copies the text summary as before, and the caret on its right offers **Copy as text** / **Copy as image** on hover or click. The image is a 1200×675-or-taller card drawn in the app's dark palette with the sparkDash mark, the unit, the model, the engine and exposure badges the LLM panel shows (TensorFold, sgLang, vLLM, … plus Open · Local), one row per level and the same legend the dialog shows. On by default (Settings → **Benchmark share image** turns it off, restoring the plain text button); it copies where the page has an image clipboard — HTTPS or localhost — and otherwise downloads the PNG, and says so in the menu rather than pretending.
+
+### Fixed
+- **GPU process VRAM on multi-GPU hosts** — the compute-apps cache was keyed by PID, so a process holding memory on two cards (llama.cpp with a layer split) showed only the last card's share. Entries are keyed by PID + GPU uuid and the process list sums a PID across cards.
+- **Decode bench “Too many benchmark requests”** — start quota was 6/min stacked with a 2/min cooldown, and failed retries still burned the quota. Starts are now 20/min, cooldown is 3s (double-click only), and 400/409 responses do not count.
+- **Decode bench 24×/32× work budget ([#93](https://github.com/MiaAI-Lab/sparkDash/issues/93))** — the post-1.8.6 security cap (131k total tokens) rejected a full concurrency sweep at 2048 max tokens. The cap is 262k so every advertised level fits.
+- **Prefill bench still dying at ~5 min** — Node undici aborts streams with no headers/body after 300s. Long prefills now use an Agent with those idle timeouts disabled; the per-size AbortSignal remains the bound.
+- **SGLang live Prefill tok/s latching ([#99](https://github.com/MiaAI-Lab/sparkDash/issues/99))** — the poll picked its Prometheus applier from the *displayed* rates, so a non-zero prefill kept selecting the cache-split path (which by design never writes `prefillTps`) and the value could not return to 0. Which applier runs now depends on whether `/server_info` carries `total_*` counters on that poll. The token baseline is also seeded outside the rate window, so the first poll after a restart no longer turns the engine's lifetime prompt counter into a rate.
+- **SGLang prefill tok/s split** — with `--enable-metrics` the cached/uncached rows differenced `prompt_tokens_total` as the computed side, so “uncached” double-counted the prefix-cache hits and the hit rate read ~49% where the device truth was ~98%. The tile now reports the prompt tokens taken in during the poll window — cache-served + computed — and the rows below split that total, all from `realtime_tokens_total{mode="prefill_compute"|"prefill_cache"}` (`prefill_effective_tokens_total{mode="input"}` / `cached_tokens_total{cache_source="device"}`, then prompt − cached, as fallbacks). A window that prefilled nothing reads 0 even while unrelated requests are still decoding, instead of holding the previous value.
+- **`SPARKDASH_TOKEN` never reached the container ([#86](https://github.com/MiaAI-Lab/sparkDash/pull/86))** — the compose file did not pass it through, so a `BIND_HOST=0.0.0.0` install failed closed no matter what `.env` said. The empty default still reads as "no token".
+- **Tailscale addresses classified as public ([#89](https://github.com/MiaAI-Lab/sparkDash/pull/89))** — `100.64.0.0/10`, where a tailnet lives, now reads as LAN on the endpoint-exposure indicator.
+- **SGLang served model ID ([#95](https://github.com/MiaAI-Lab/sparkDash/pull/95))** — the panel and the bench requests use the id from `/v1/models` (what the server accepts), keeping the native storage path on `modelPath`.
+- **Remote SSH session churn** — collectors reuse an authenticated SSH transport instead of creating a full SSH/PAM login for every metric poll. `SSH_CONTROL_PERSIST_SECONDS=0` restores one connection per command if needed.
+- **Shutdown controls ([#90](https://github.com/MiaAI-Lab/sparkDash/issues/90))** — three separate failures on the shutdown path: a local unit in Docker called the host helper from inside the container (no sudo there) instead of entering the host mount namespace; the remote command joined its lines with `;`, so the backgrounded line ended in `&;` and the shell rejected the whole script before running anything; and the authorization probe was `sudo -n true`, which a sudoers rule scoped to the helper does not authorize. The probe is now the helper's own `--check` (see the README contract), with `sudo -n true` kept as a fallback for broader sudo setups. A local unit whose helper or `nsenter` is missing now reports the error instead of logging success.
+
+---
+
+## [1.8.8] — 2026-09-22
+
+### Fixed
+- **SGLang overview tok/s stuck at 0** — `generation_tokens_total` on current SGLang builds only moves when a request finishes, so the live rate was 0 for the whole decode and then one spiked poll. Overview now uses `gen_throughput` while a request is running.
+
+---
+
+## [1.8.7] — 2026-09-22
+
+### Changed
+- **Decode bench code concurrency** — each concurrent code stream is a different Python task (binary search, LRU, …), starting with its own name so the prompts do not share a prefix. The code warmup is a separate `warmup_noop` prompt, so stream 1 is not a cache hit of the warmup. Concurrency 1 is `binary_search`.
+
+---
+
+## [1.8.6] — 2026-09-01
+
+### Added
+- **Prefill benchmark** — sequential context-size sweep (1k–300k) measuring prefill tok/s (`prompt_tokens` ÷ TTFT) and TTFT. Unique prefix per size so prefix-cache does not inflate later runs. Button on the LLM card; persisted last run. Per-size timeout scales with context (90s floor, ~8 ms/token, 45 min cap).
+- **DGX Spark CPU temperature** — remote Sparks collect CPU temp over SSH with the same hwmon allowlist as hosts (`acpitz` / `coretemp` / `k10temp` / `zenpower`; NVMe / CX7 filtered out). Overview shows a CPU bar and Spark pages show a CPU row on the GPU panel when the reading is above 0°C.
+
+### Fixed
+- **Prefill bench 256k timeout** — per-size cap was 12 minutes (`~3 ms/token`); slow prefills aborted before first token. Now ~8 ms/token with a 45 minute cap, and the error names the limit.
+- **Copy results tok/s** — clipboard text now uses one decimal like the decode-bench table (`31.5` not `31`), and TTFT uses the same mean as the table. ([#57](https://github.com/MiaAI-Lab/sparkDash/issues/57))
+- **SGLang log spam** — probe current `/server_info` and `/model_info` first; keep the deprecated `/get_*` aliases as fallback so old servers still work. ([#52](https://github.com/MiaAI-Lab/sparkDash/issues/52))
+
+---
+
+## [1.8.5] — 2026-08-28
+
+### Fixed
+- **Decode type picker defaults to Structured** — opening the sheet (or loading a previous run) no longer leaves Prose/Code/JSON selected. A still-running job still shows its type.
+- **Code workload was prose-speed** — the LRU + "thorough comments" prompt is English with `def` sprinkled in, so DFlash2 accept matched Prose. Code is now `clamp_00`…`clamp_49` identical-shape Python helpers, no comments.
+
+---
+
+## [1.8.4] — 2026-08-28
+
+### Added
+- **Decode benchmark type picker** — choose **Structured** (default, count 1→200), **Prose** (lab hash-map explanation), **Code** (fixed LRU-cache Python prompt), or **JSON** (GPU-metrics catalog) before Run. Labels are output types only — no `response_format`, grammars, or guided JSON. Same lab protocol for every type: temp 0, `top_p` 1, thinking off, 32-token warmup, default 400 tokens. The selected type is shown on results and in copied summaries.
+
+---
+
+## [1.8.3] — 2026-08-28
+
+### Changed
+- **Decode benchmark uses the lab structured protocol** — count 1→200 (numbers only) instead of the Showcase JSON/YAML catalog + fill-to-max. Temperature **0**, `top_p` **1**, thinking **off**, 32-token warmup, default max tokens **400**. Concurrency 1 is the same prompt as glm-5.3-flash-sm120 `tests/bench_decode.py --structured`; concurrent streams get a unique suffix so they do not share a prefix-cache block.
+- **Thinking flags default off** — GLM / Qwen / MiniMax think unless the request disables it. `applyThinkingFlags` now defaults to off and always sends `enable_thinking`, `thinking`, and `thinking_mode`. HTTP 400 retries keep an explicit off payload instead of stripping flags (stripping lets hybrid models think by default). Showcase treats a missing thinking flag as off.
+
+---
+
+## [1.8.2] — 2026-08-23
+
+### Added
+- **EXL3 live tok/s** — detect ExLlamaV3 `tools/serve_openai.py` (`owned_by: exl3` or `/health` `{ok, busy}`) instead of mislabeling it as vLLM. Generation and prefill tok/s come from `/health` cumulative token counters (no Prometheus `/metrics`).
 - **Tailnet monitoring** — opt-in per unit (`tailscaleMonitoring`, default **off**); `tailscale status --json` on the host and a Tailnet card under Resources. Flags a unit that is healthy on the LAN but off its tailnet. ([#43](https://github.com/MiaAI-Lab/sparkDash/pull/43))
+- **NV_ERR_NO_MEMORY on the GPU panel** — count of NVRM `NV_ERR_NO_MEMORY` kernel log lines since boot (shown when > 0). Journal is scanned at most once a minute, not on the 2s poll. Replaces the approach in [#40](https://github.com/MiaAI-Lab/sparkDash/pull/40).
 
 ### Security
 - **`BIND_HOST` now defaults to `127.0.0.1` (loopback) instead of `0.0.0.0`** — the dashboard is unauthenticated and can SSH into and power off Sparks, so it is no longer reachable on the LAN by default. Set `BIND_HOST` to the host's LAN IP (or `0.0.0.0`) to opt in to remote access. **Migration:** if you access sparkDash from another machine via bare-metal `npm start`, set `BIND_HOST` explicitly. Production and dev Compose both set `BIND_HOST=0.0.0.0` (`network_mode: host`). Startup now also warns when bound to a non-loopback address. ([#35](https://github.com/MiaAI-Lab/sparkDash/pull/35))
@@ -20,6 +109,7 @@ Format: version sections are listed newest first.
 - **Host CPU temperature** — dedicated GPU hosts (`kind: host`) show CPU temp on the RAM panel and Overview (hidden at 0°C / no sensor). Remote hosts now read hwmon/thermal over SSH. DGX Sparks still do not display CPU temp (remote Sparks still skip the extra sensor SSH). ([#34](https://github.com/MiaAI-Lab/sparkDash/pull/34))
 
 ### Changed
+- Docker Node base image pulls from `public.ecr.aws/docker/library/node` so Spark builds do not fail on Docker Hub IPv6 `auth.docker.io` / “network is unreachable”. `deploy.sh` prints that workaround if a build still fails.
 - README architecture diagram top border aligned with the box. ([#39](https://github.com/MiaAI-Lab/sparkDash/pull/39))
 
 ---

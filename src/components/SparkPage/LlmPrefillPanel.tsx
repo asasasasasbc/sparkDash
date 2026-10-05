@@ -201,14 +201,17 @@ export function LlmPrefillPanel({ llm, sparkId, llmPort }: LlmPrefillPanelProps)
 
   if (!llm) return null;
 
-  const totalPrefill = llm.totalPrefillTokens || 0;
-  const hasSplit =
-    llm.totalCachedPrefillTokens != null && llm.totalUncachedPrefillTokens != null;
-  const cached = hasSplit ? llm.totalCachedPrefillTokens || 0 : null;
-  const uncached = llm.totalUncachedPrefillTokens ?? null;
+  const totalPrefill = llm.totalPromptTokens || 0;
+  // Upstream probes expose the full prompt total plus the cached share; the
+  // uncached/computed part is the remainder.
+  const hasSplit = llm.totalPromptTokens != null && llm.totalCachedTokens != null;
+  const cached = hasSplit ? llm.totalCachedTokens || 0 : null;
+  const uncached = hasSplit
+    ? Math.max(0, (llm.totalPromptTokens || 0) - (llm.totalCachedTokens || 0))
+    : null;
 
-  const uncEff = hasSplit ? llm.totalUncachedPrefillTokens || 0 : totalPrefill;
-  const cacheEff = hasSplit ? llm.totalCachedPrefillTokens || 0 : 0;
+  const uncEff = hasSplit ? uncached || 0 : totalPrefill;
+  const cacheEff = hasSplit ? cached || 0 : 0;
   const cost =
     (uncEff / 1e6) * (prices.uncached ?? DEFAULT_LLM_PRICES.uncached) +
     (cacheEff / 1e6) * (prices.cached ?? DEFAULT_LLM_PRICES.cached) +

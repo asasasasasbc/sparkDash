@@ -3,6 +3,14 @@
  *
  * Measures real post-first-token decode tok/s against an OpenAI-compatible
  * chat completions endpoint. Concurrency levels run one after another.
+ *
+ * Output types (structured / prose / code / json) are prompt labels only —
+ * never response_format, grammars, or guided JSON.
+ *
+ * Structured protocol (matches glm-5.3-flash-sm120 tests/bench_decode.py):
+ * count 1→200, temperature 0, top_p 1, thinking off, warmup 32 tokens,
+ * decode tok/s = (completion_tokens − 1) / (last − first token).
+ * The same sampling protocol applies to every type.
  */
 
 import { randomUUID } from "crypto";
@@ -20,9 +28,14 @@ import {
   stripFillForceFields,
 } from "./LlmStreaming.js";
 import {
-  pickShowcasePrompts,
-  withFillToMaxInstruction,
+  pickDecodeBenchPrompts,
+  decodeBenchPromptForType,
+  normalizeDecodeBenchType,
+  DECODE_BENCH_DEFAULT_TYPE,
+  DECODE_BENCH_TYPES,
+  DECODE_CODE_WARMUP_PROMPT,
 } from "../../src/shared/llmPrompts.js";
+import { formatLlmBaseUrl } from "../../src/shared/llmTarget.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,12 +46,13 @@ const HISTORY_PATH =
 const ACTIVE_PATH =
   process.env.BENCH_ACTIVE_PATH || path.join(ROOT, "config", "bench-active.json");
 
-/** Same catalog + fill-to-max as Showcase structural; temperature 0; thinking off. */
+/** Lab protocol: temperature 0; thinking off; top_p 1. Structured default. */
 
 const ALLOWED_CONCURRENCIES = new Set([1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32]);
-const DEFAULT_MAX_TOKENS = 512;
+const DEFAULT_MAX_TOKENS = 400;
 const MIN_MAX_TOKENS = 64;
 const MAX_MAX_TOKENS = 2048;
+const WARMUP_MAX_TOKENS = 32;
 const PER_REQUEST_TIMEOUT_MS = 360_000;
 const WAVE_TIMEOUT_MS = 360_000;
 const HISTORY_LIMIT = 10;
@@ -85,14 +99,60 @@ async function pollHardwareSamples(sampleHardware, signal, intervalMs = HARDWARE
   return samples;
 }
 
-/** Same cycling as Showcase structural, plus the shared fill-to-max suffix. */
-function pickBenchPrompts(count) {
-  return pickShowcasePrompts("structural", count).map(withFillToMaxInstruction);
+/** Lab prompt for the selected type on every stream (C1 is the exact prompt). */
+function pickBenchPrompts(count, type) {
+  return pickDecodeBenchPrompts(count, type);
+}
+
+function decodeRequestBody(modelId, prompt, maxTokens) {
+  const body = {
+    model: modelId || undefined,
+    messages: [{ role: "user", content: prompt }],
+    max_tokens: maxTokens,
+    temperature: 0,
+    top_p: 1,
+    stream: true,
+    stream_options: { include_usage: true },
+  };
+  applyThinkingFlags(body, modelId, false);
+  return body;
+}
+
+/**
+ * Short count stream so DFlash2 / Triton JIT is not billed on the first wave.
+ * Best-effort: a warmup failure does not fail the job.
+ */
+async function warmupDecode({ baseUrl, modelId, abortSignal, apiKey, debug = false, promptType = DECODE_BENCH_DEFAULT_TYPE }) {
+  const url = `${baseUrl}/v1/chat/completions`;
+  const kind = normalizeDecodeBenchType(promptType);
+  const warmupPrompt =
+    kind === "code" ? DECODE_CODE_WARMUP_PROMPT : decodeBenchPromptForType(kind);
+  const body = decodeRequestBody(modelId, warmupPrompt, WARMUP_MAX_TOKENS);
+  const ctrl = new AbortController();
+  const onParentAbort = () => ctrl.abort();
+  if (abortSignal) {
+    if (abortSignal.aborted) ctrl.abort();
+    else abortSignal.addEventListener("abort", onParentAbort, { once: true });
+  }
+  const timeout = setTimeout(() => ctrl.abort(), PER_REQUEST_TIMEOUT_MS);
+  try {
+    await runStreamingRequest(url, body, ctrl.signal, {
+      debug,
+      retryOnThinking400: true,
+      thinking: false,
+      apiKey,
+    });
+  } catch {
+    /* ignore */
+  } finally {
+    clearTimeout(timeout);
+    if (abortSignal) abortSignal.removeEventListener("abort", onParentAbort);
+  }
 }
 
 /**
  * Run one concurrency wave: N simultaneous streams.
- * Prompts cycle the structural catalog (repeats after the catalog length).
+ * Prompts use the selected decode type (structured default).
  */
 function emptyWaveResult(concurrency, waveMs, results, modelId, error, prompts = [], debug = false) {
   return {
@@ -185,9 +245,10 @@ async function runConcurrencyWave({
   sampleHardware = null,
   debug = false,
   apiKey = null,
+  promptType = DECODE_BENCH_DEFAULT_TYPE,
 }) {
   const url = `${baseUrl}/v1/chat/completions`;
-  const prompts = pickBenchPrompts(concurrency);
+  const prompts = pickBenchPrompts(concurrency, promptType);
   const reqMeta = { url, modelId, maxTokens };
 
   const wallStart = performance.now();
@@ -218,21 +279,16 @@ async function runConcurrencyWave({
     }
 
     const body = {
-      model: modelId || undefined,
-      messages: [{ role: "user", content: prompts[streamIndex] }],
-      max_tokens: maxTokens,
+      ...decodeRequestBody(modelId, prompts[streamIndex], maxTokens),
       min_tokens: maxTokens,
       ignore_eos: true,
       stop: [],
-      temperature: 0,
-      stream: true,
-      stream_options: { include_usage: true },
     };
-    applyThinkingFlags(body, modelId, false);
 
     const streamOpts = {
       debug,
       retryOnThinking400: true,
+      thinking: false,
       apiKey,
     };
 
@@ -383,6 +439,10 @@ export class DecodeBenchManager {
     this.activePath = activePath;
     this._loadHistory();
     this._recoverInterruptedActive();
+  }
+
+  activeCount() {
+    return this.activeBySpark.size;
   }
 
   getJob(benchId) {
@@ -583,6 +643,12 @@ export class DecodeBenchManager {
       } catch {
         /* ignore */
       }
+      try {
+        job._closeTarget?.();
+      } catch {
+        /* ignore */
+      }
+      job._closeTarget = null;
       job.status = "failed";
       job.error = reason;
       job.progress.message = "Interrupted";
@@ -615,9 +681,15 @@ export class DecodeBenchManager {
    *   modelId: string | null,
    *   concurrencies: number[],
    *   maxTokens?: number,
+   *   promptType?: string,
    *   debug?: boolean,
    *   sampleHardware?: (() => Promise<object | null> | object | null) | null,
    *   apiKey?: string | null,
+   *   resolveTarget?: (ctx: { onStatus?: Function, signal?: AbortSignal }) => Promise<{
+   *     host: string, port: number, tls?: boolean, via?: string, close: () => void
+   *   }>,
+   *   host?: string | null,
+   *   tls?: boolean,
    * }} opts
    */
   start(opts) {
@@ -628,9 +700,14 @@ export class DecodeBenchManager {
       modelId,
       concurrencies: rawConc,
       maxTokens: rawMax,
+      promptType: rawType,
       debug = false,
       sampleHardware = null,
       apiKey = null,
+      resolveTarget = null,
+      host: rawHost = null,
+      tls: rawTls = false,
+      owner = null,
     } = opts;
 
     if (this.activeBySpark.has(sparkId)) {
@@ -662,6 +739,7 @@ export class DecodeBenchManager {
       throw err;
     }
 
+    const promptType = normalizeDecodeBenchType(rawType);
     const debugOn = Boolean(debug);
     const benchId = randomUUID();
     const abort = new AbortController();
@@ -676,7 +754,11 @@ export class DecodeBenchManager {
         modelId: modelId || null,
         concurrencies,
         maxTokens,
+        promptType,
         ...(debugOn ? { debug: true } : {}),
+        ...(rawHost
+          ? { host: String(rawHost).trim(), tls: Boolean(rawTls) }
+          : {}),
       },
       progress: {
         currentConcurrency: null,
@@ -691,6 +773,9 @@ export class DecodeBenchManager {
       _apiKey: apiKey != null && String(apiKey).trim() ? String(apiKey).trim() : null,
       _sampleHardware:
         debugOn && typeof sampleHardware === "function" ? sampleHardware : null,
+      _resolveTarget: typeof resolveTarget === "function" ? resolveTarget : null,
+      _closeTarget: null,
+      owner: owner ? { id: owner.id, via: owner.via } : null,
     };
 
     this.jobs.set(benchId, job);
@@ -716,9 +801,44 @@ export class DecodeBenchManager {
   }
 
   async _runJob(job, lanIp) {
-    const baseUrl = `http://${lanIp}:${job.config.port}`;
     const debug = Boolean(job._debug);
+    let host = lanIp;
+    let port = job.config.port;
+    let tls = Boolean(job.config.tls);
     try {
+      if (typeof job._resolveTarget === "function") {
+        job.progress.message = "Connecting to LLM…";
+        this._checkpointActive();
+        const target = await job._resolveTarget({
+          onStatus: (msg) => {
+            if (typeof msg === "string" && msg) job.progress.message = msg;
+            this._checkpointActive();
+          },
+          signal: job._abort.signal,
+        });
+        host = target?.host || host;
+        port = Number.isInteger(target?.port) ? target.port : port;
+        if (target?.tls != null) tls = Boolean(target.tls);
+        job._closeTarget = typeof target?.close === "function" ? target.close : null;
+        if (target?.via === "ssh-tunnel") {
+          job.progress.message = "Warming up via SSH tunnel…";
+        }
+      }
+      const baseUrl = formatLlmBaseUrl({ host, port, tls });
+      if (!job._abort.signal.aborted) {
+        if (!String(job.progress.message || "").startsWith("Warming up")) {
+          job.progress.message = "Warming up…";
+        }
+        this._checkpointActive();
+        await warmupDecode({
+          baseUrl,
+          modelId: job.config.modelId,
+          abortSignal: job._abort.signal,
+          apiKey: job._apiKey,
+          debug,
+          promptType: job.config.promptType,
+        });
+      }
       for (const c of job.config.concurrencies) {
         if (job._abort.signal.aborted) {
           if (job.status === "running") {
@@ -742,6 +862,7 @@ export class DecodeBenchManager {
           sampleHardware: job._sampleHardware,
           debug,
           apiKey: job._apiKey,
+          promptType: job.config.promptType,
         });
 
         if (job._abort.signal.aborted) {
@@ -785,6 +906,12 @@ export class DecodeBenchManager {
         }
       }
     } finally {
+      try {
+        job._closeTarget?.();
+      } catch {
+        /* ignore */
+      }
+      job._closeTarget = null;
       if (job.completedAt == null) job.completedAt = Date.now();
       this.activeBySpark.delete(job.sparkId);
       this._pushHistory(job);
@@ -802,6 +929,8 @@ export class DecodeBenchManager {
     this._saveHistory();
   }
 }
+
+export { ALLOWED_CONCURRENCIES, DEFAULT_MAX_TOKENS, normalizeConcurrencies };
 
 function normalizeConcurrencies(raw) {
   if (!Array.isArray(raw)) return [];
@@ -830,6 +959,7 @@ function publicJob(job) {
       job.completedAt != null
         ? job.completedAt - job.startedAt
         : Date.now() - job.startedAt,
+    owner: job.owner || null,
   };
 }
 
@@ -840,4 +970,6 @@ export const DECODE_BENCH_DEFAULTS = {
   defaultMaxTokens: DEFAULT_MAX_TOKENS,
   minMaxTokens: MIN_MAX_TOKENS,
   maxMaxTokens: MAX_MAX_TOKENS,
+  promptTypes: [...DECODE_BENCH_TYPES],
+  defaultPromptType: DECODE_BENCH_DEFAULT_TYPE,
 };

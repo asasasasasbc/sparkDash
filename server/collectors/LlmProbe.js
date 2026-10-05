@@ -10,6 +10,9 @@ import { llmProbeHost } from "./llmHost.js";
 
 const FAIL_RESET_THRESHOLD = 3;
 const REDETECT_INTERVAL_MS = 60_000;
+/** Current SGLang names first. Deprecated aliases still work but log a warning per hit. */
+const SGLANG_SERVER_INFO_PATHS = ["/server_info", "/get_server_info"];
+const SGLANG_MODEL_INFO_PATHS = ["/model_info", "/get_model_info"];
 /**
  * SGLang's last_gen_throughput is a sticky gauge (holds last decode rate when
  * idle). Only treat it as live after we observe a change between polls, and
@@ -63,7 +66,7 @@ export class LlmProbe {
     this.baseUrl = `http://${llmProbeHost(spark)}:${port}`;
 
     // State
-    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'ds4' | null
+    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'ds4' | 'exl3' | 'q27' | 'tensorfold' | null
     this.serverIsOpenAI = null; // true = OpenAI-compatible
     /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
     this.authOpen = null;
@@ -89,18 +92,22 @@ export class LlmProbe {
     this.lastPrefillKinds = null;
     /** Previous vLLM TTFT histogram `_sum` (seconds). null until first sample. */
     this.lastTtftSum = null;
+    /** Previous vLLM TTFT histogram `_count` (requests). null until first sample. */
+    this.lastTtftCount = null;
     /** Previous `vllm:iteration_tokens_total_sum` (engine-step tokens). */
     this.lastIterSum = null;
     this.lastProbeTime = 0;
 
     // Cumulative total output tokens (generation) as reported by the LLM server
     this.totalOutputTokens = 0;
-    // Cumulative total prefill (input) tokens as reported by the LLM server
-    this.totalPrefillTokens = 0;
-    /** Cumulative cached-prefill tokens (split backends); null when the split is unknown. */
-    this.totalCachedPrefillTokens = null;
-    /** Cumulative uncached/computed prefill tokens (split backends); null when the split is unknown. */
-    this.totalUncachedPrefillTokens = null;
+    /** Cumulative total prompt (prefill) tokens as reported by the LLM server. */
+    this.totalPromptTokens = null;
+    /**
+     * Cumulative cached (prefix-cache served) prompt tokens, when the backend
+     * reports the split. Subset of totalPromptTokens (for ds4/q27 the raw
+     * prefill counter is computed-only, so prompt = computed + cached).
+     */
+    this.totalCachedTokens = null;
 
     // vLLM inference metrics from /metrics (null when not vLLM / missing series)
     // Metric names follow stock vLLM Prometheus exposition (versions may differ).
@@ -108,6 +115,8 @@ export class LlmProbe {
     this.requestsRunning = null;
     this.requestsWaiting = null;
     this.ttftP95Seconds = null;
+    /** Live recent-window mean TTFT (seconds) from histogram sum/count deltas. null when unavailable. */
+    this.ttftSeconds = null;
     this.preemptionsTotal = null; // cumulative counter
     /** Prefix cache hit rate 0–1 (hits/queries). */
     this.prefixCacheHitRate = null;
@@ -122,6 +131,17 @@ export class LlmProbe {
     this._lastDetectAt = 0;
     /** @type {{ value: number, liveUntil: number } | null} */
     this._sglangStickyTps = null;
+    /** Latest gen_throughput from /v1/loads, if that payload carried one. */
+    this._sglangLoadGenTps = null;
+    /** Whether this poll's /server_info carried total_input/output_tokens. */
+    this._sglangTotalsPolled = false;
+    /**
+     * Series that seeded `lastTokenCounts` — "server_info" or "prometheus".
+     * They count the same work under different names, so a hand-off re-seeds
+     * the baseline instead of differencing across the two.
+     * @type {"server_info" | "prometheus" | null}
+     */
+    this._sglangTokenSource = null;
   }
 
   /**
@@ -148,15 +168,11 @@ export class LlmProbe {
       this.cachedPrefillTps = null;
       this.uncachedPrefillTps = null;
       this.lastPrefillKinds = null;
-      this.totalCachedPrefillTokens = null;
-      this.totalUncachedPrefillTokens = null;
       return;
     }
     const total = cachedCount + computedCount;
     this.prefixCacheHitRate =
       total > 0 ? Math.round((cachedCount / total) * 10000) / 10000 : null;
-    this.totalCachedPrefillTokens = cachedCount;
-    this.totalUncachedPrefillTokens = computedCount;
     if (this.lastPrefillKinds == null) {
       this.lastPrefillKinds = { cached: cachedCount, computed: computedCount };
       this.cachedPrefillTps = 0;
@@ -245,13 +261,13 @@ export class LlmProbe {
     this.slotsActive = 0;
     this.slotsTotal = 0;
     this.totalOutputTokens = 0;
-    this.totalPrefillTokens = 0;
-    this.totalCachedPrefillTokens = null;
-    this.totalUncachedPrefillTokens = null;
+    this.totalPromptTokens = null;
+    this.totalCachedTokens = null;
     this.kvCacheUsage = null;
     this.requestsRunning = null;
     this.requestsWaiting = null;
     this.ttftP95Seconds = null;
+    this.ttftSeconds = null;
     this.preemptionsTotal = null;
     this.prefixCacheHitRate = null;
     this.e2eP95Seconds = null;
@@ -261,8 +277,10 @@ export class LlmProbe {
     this.lastTokenCounts = { input: 0, output: 0 };
     this.lastPrefillKinds = null;
     this.lastTtftSum = null;
+    this.lastTtftCount = null;
     this.lastIterSum = null;
     this._sglangStickyTps = null;
+    this._sglangLoadGenTps = null;
   }
 
   /** Note auth from an HTTP status on an unauthenticated probe request. */
@@ -288,7 +306,10 @@ export class LlmProbe {
     if (
       this.backendType !== "vllm" &&
       this.backendType !== "sglang" &&
-      this.backendType !== "ds4"
+      this.backendType !== "ds4" &&
+      this.backendType !== "exl3" &&
+      this.backendType !== "q27" &&
+      this.backendType !== "tensorfold"
     ) {
       const slotUrl = `${this.baseUrl}/slots`;
       try {
@@ -335,33 +356,72 @@ export class LlmProbe {
   }
 
   /**
-   * Classify an OpenAI-compatible server: ds4-server, SGLang, or vLLM (default).
+   * Classify an OpenAI-compatible server: ds4, SGLang, EXL3, q27, TensorFold, or vLLM (default).
    * @param {unknown} ownedBy
-   * @returns {Promise<"ds4" | "sglang" | "vllm">}
+   * @returns {Promise<"ds4" | "sglang" | "exl3" | "q27" | "tensorfold" | "vllm">}
    */
   async _classifyOpenAIBackend(ownedBy) {
     if (typeof ownedBy === "string") {
       if (/ds4/i.test(ownedBy)) return "ds4";
       if (/sglang/i.test(ownedBy)) return "sglang";
+      if (/exl3/i.test(ownedBy)) return "exl3";
+      // q27's /v1/models reports owned_by: "q27" (signalnine/q27 engine).
+      if (/q27/i.test(ownedBy)) return "q27";
+      // TensorFold (ashhart/TensorFold) reports owned_by: "tensorfold" on both MLX and CUDA servers.
+      if (/tensorfold/i.test(ownedBy)) return "tensorfold";
     }
     if (await this._probeIsDs4()) return "ds4";
     if (await this._probeIsSglang()) return "sglang";
+    if (await this._probeIsExl3()) return "exl3";
+    if (await this._probeIsQ27()) return "q27";
     return "vllm";
   }
 
-  /** True when SGLang native server-info endpoints respond. */
-  async _probeIsSglang() {
-    for (const path of ["/get_server_info", "/server_info"]) {
+  /**
+   * True when EXL3 `tools/serve_openai.py` /health exposes backend + token totals.
+   * Distinguishes from vLLM's /health (no `busy` + `completion_tokens_total`).
+   */
+  async _probeIsExl3() {
+    try {
+      const res = await this._fetch(`${this.baseUrl}/health`);
+      if (!res.ok) return false;
+      const data = await res.json().catch(() => null);
+      return LlmProbe._healthLooksLikeExl3(data);
+    } catch {
+      return false;
+    }
+  }
+
+  /** @param {unknown} data */
+  static _healthLooksLikeExl3(data) {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+    if (data.backend === "exl3") return true;
+    // tools/serve_openai.py: { ok, busy } even before token counters existed.
+    return data.ok === true && typeof data.busy === "boolean";
+  }
+
+  /**
+   * First successful SGLang JSON from `paths` (current name, then deprecated alias).
+   * @param {string[]} paths
+   * @returns {Promise<object|null>}
+   */
+  async _fetchSglangJson(paths) {
+    for (const path of paths) {
       try {
         const res = await this._fetch(`${this.baseUrl}${path}`);
         if (!res.ok) continue;
         const data = await res.json().catch(() => null);
-        if (data && typeof data === "object" && !Array.isArray(data)) return true;
+        if (data && typeof data === "object" && !Array.isArray(data)) return data;
       } catch {
         /* try next */
       }
     }
-    return false;
+    return null;
+  }
+
+  /** True when SGLang native server-info endpoints respond. */
+  async _probeIsSglang() {
+    return (await this._fetchSglangJson(SGLANG_SERVER_INFO_PATHS)) != null;
   }
 
   /** True when Prometheus /metrics exposes ds4-server series (ds4-on-spark). */
@@ -381,6 +441,25 @@ export class LlmProbe {
     return /(?:^|\n)ds4_tokens_decoded_total(?:\{|\s)/m.test(String(body || ""));
   }
 
+  /** True when Prometheus /metrics exposes q27-series (signalnine/q27 engine). */
+  async _probeIsQ27() {
+    try {
+      const res = await this._fetch(`${this.baseUrl}/metrics`);
+      if (!res.ok) return false;
+      const txt = await res.text();
+      return LlmProbe._metricsLookLikeQ27(txt);
+    } catch {
+      return false;
+    }
+  }
+
+  /** @param {string} body */
+  static _metricsLookLikeQ27(body) {
+    return /(?:^|\n)q27_(?:decode_tokens_(?:processed_)?total|requests_total)(?:\{|\s)/m.test(
+      String(body || "")
+    );
+  }
+
   // ─── OpenAI-compatible path (vLLM/sglang/ds4) ────────────
   async _probeOpenAICompatible() {
     const now = Date.now();
@@ -390,6 +469,7 @@ export class LlmProbe {
     // Model info from /v1/models — 401/403 means protected; other failure = down
     let modelsOk = false;
     let owned = null;
+    let servedModelId = null;
     try {
       const modelsRes = await this._fetch(`${this.baseUrl}/v1/models`);
       const auth = this._noteAuthStatus(modelsRes.status);
@@ -400,7 +480,8 @@ export class LlmProbe {
         modelsOk = true;
         const modelsData = await modelsRes.json();
         const model = modelsData?.data?.[0];
-        this.modelId = normalizeModelId(model?.id || null);
+        servedModelId = normalizeModelId(model?.id || null);
+        this.modelId = servedModelId;
         // Drop HF hub cache paths from modelPath if /v1/models id was a cache dir
         if (isHfHubCachePath(model?.id)) this.modelPath = null;
         // ds4-server uses context_length; vLLM uses max_model_len
@@ -419,36 +500,85 @@ export class LlmProbe {
       if (/ds4/i.test(owned)) this.backendType = "ds4";
       else if (/sglang/i.test(owned) && this.backendType !== "ds4") {
         this.backendType = "sglang";
+      } else if (/exl3/i.test(owned) && this.backendType !== "ds4") {
+        this.backendType = "exl3";
+      } else if (/tensorfold/i.test(owned) && this.backendType !== "ds4") {
+        this.backendType = "tensorfold";
       }
     }
 
-    // SGLang: native info endpoints. Skip on known vLLM/ds4 to avoid 404 spam.
-    if (this.backendType === "sglang" || this.backendType == null) {
+    // TensorFold: no Prometheus. /health carries cumulative token totals when the
+    // server publishes them; without them tok/s stays 0 rather than guessing.
+    if (this.backendType === "tensorfold") {
       try {
-        const sgRes = await this._fetch(`${this.baseUrl}/get_server_info`);
-        if (sgRes.ok) {
-          this.backendType = "sglang";
-          const sgData = await sgRes.json();
-          this._applySglangServerInfo(sgData, dtSec);
+        const healthRes = await this._fetch(`${this.baseUrl}/health`);
+        if (healthRes.ok) {
+          const health = await healthRes.json().catch(() => null);
+          this._applyTensorFoldHealth(health, dtSec);
+        } else {
+          this._applyTensorFoldHealth(null, dtSec);
         }
-      } catch {}
+      } catch {
+        this._applyTensorFoldHealth(null, dtSec);
+      }
+      return this._getSnapshot();
+    }
+
+    // EXL3 serve_openai.py: live tok/s from /health cumulative counters (no Prometheus).
+    if (this.backendType === "exl3" || this.backendType == null) {
+      try {
+        const healthRes = await this._fetch(`${this.baseUrl}/health`);
+        if (healthRes.ok) {
+          const health = await healthRes.json().catch(() => null);
+          if (LlmProbe._healthLooksLikeExl3(health)) {
+            this.backendType = "exl3";
+            this._applyExl3Health(health, dtSec);
+            return this._getSnapshot();
+          }
+        }
+      } catch {
+        /* health optional unless already classified exl3 */
+      }
+      if (this.backendType === "exl3") return this._getSnapshot();
+    }
+
+    // SGLang: native info endpoints. Skip on known vLLM/ds4 to avoid 404 spam.
+    // Prefer /server_info — /get_server_info is a deprecated alias that logs every poll.
+    if (this.backendType === "sglang" || this.backendType == null) {
+      this._sglangTotalsPolled = false;
+      const sgData = await this._fetchSglangJson(SGLANG_SERVER_INFO_PATHS);
+      if (sgData) {
+        this.backendType = "sglang";
+        // Load before last_gen_throughput so inflight can keep a steady rate live.
+        await this._probeSglangLoad();
+        this._applySglangServerInfo(sgData, dtSec);
+        // Engine tile: Active vs Sleeping. SGLang has no live sleep gauge
+        // (sleep_on_idle is a launch flag, not current state). A reachable
+        // server with weights resident is Active / ready.
+        if (this.gpuMemoryUtilization == null) this.gpuMemoryUtilization = 1;
+      }
     }
 
     if (this.backendType === "sglang") {
       // Prometheus is optional (--enable-metrics). Do not mix those counters
-      // into lastTokenCounts when /get_server_info already produced live rates.
+      // into lastTokenCounts when this poll's server-info totals own them.
+      // Gate on which series answered, never on the displayed rates: a live
+      // rate keeps the split path selected forever, and the split path is not
+      // allowed to clear prefillTps — the value then latches (#99).
       try {
         const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
         if (metricsRes.ok) {
           const txt = await metricsRes.text();
-          const idle = this.generationTps === 0 && this.prefillTps === 0;
-          if (idle) this._applySglangMetrics(txt, dtSec);
-          else this._applySglangPrefillSplit(txt, dtSec);
+          if (this._sglangTotalsPolled) this._applySglangPrefillSplit(txt, dtSec);
+          else this._applySglangMetrics(txt, dtSec);
         }
       } catch {
         /* metrics optional */
       }
       await this._enrichSglangModelInfo();
+      // Native SGLang endpoints expose the storage path (often just `/model`).
+      // Keep that as modelPath, but show/use the client-facing served model ID.
+      if (servedModelId) this.modelId = servedModelId;
       return this._getSnapshot();
     }
 
@@ -463,15 +593,31 @@ export class LlmProbe {
         ) {
           this.backendType = "ds4";
           this._applyDs4Metrics(txt, dtSec);
+        } else if (
+          this.backendType === "q27" ||
+          LlmProbe._metricsLookLikeQ27(txt)
+        ) {
+          this.backendType = "q27";
+          this._applyQ27Metrics(txt, dtSec);
         } else {
           this.backendType = "vllm";
           this._applyVllmMetrics(txt, dtSec);
         }
-      } else if (this.backendType !== "ds4") {
+      } else if (
+        this.backendType !== "ds4" &&
+        this.backendType !== "exl3" &&
+        this.backendType !== "q27"
+      ) {
         this.backendType = "vllm";
       }
     } catch {
-      if (this.backendType !== "ds4") this.backendType = "vllm";
+      if (
+        this.backendType !== "ds4" &&
+        this.backendType !== "exl3" &&
+        this.backendType !== "q27"
+      ) {
+        this.backendType = "vllm";
+      }
     }
 
     return this._getSnapshot();
@@ -497,6 +643,13 @@ export class LlmProbe {
       computedPrefill ?? this._getPromMetric(txt, "ds4_tokens_prefilled_total");
     const inflightHint = this._getPromMetric(txt, "ds4_requests_inflight");
     const inflight = inflightHint != null && inflightHint > 0;
+    // Cumulative cached prefill for the token ledger (kind="cached" label).
+    const cachedTotal = this._getPromMetricLabeled(
+      txt,
+      "ds4_tokens_prefilled_total",
+      "kind",
+      "cached"
+    );
 
     if (decoded != null) {
       if (prefilled != null && dtSec > 0 && dtSec < 10) {
@@ -509,12 +662,18 @@ export class LlmProbe {
         this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
         if (!inflight && deltaOut <= 0) this.prefillTps = 0;
       }
-      if (prefilled != null) {
-        this.lastTokenCounts.input = prefilled;
-        this.totalPrefillTokens = prefilled;
-      }
+      if (prefilled != null) this.lastTokenCounts.input = prefilled;
       this.lastTokenCounts.output = decoded;
       this.totalOutputTokens = decoded;
+      // ds4's prefill counter is COMPUTED-only when the kind labels exist;
+      // the token ledger wants the full prompt, so add the cached share.
+      if (prefilled != null) {
+        this.totalPromptTokens =
+          cachedTotal != null && computedPrefill != null
+            ? prefilled + cachedTotal
+            : prefilled;
+      }
+      if (cachedTotal != null) this.totalCachedTokens = cachedTotal;
     } else {
       // No counters — fall back to window gauges only while something is in flight
       const gaugeGen = this._getPromMetric(txt, "ds4_decode_tok_s");
@@ -562,9 +721,194 @@ export class LlmProbe {
     this.kvCacheUsage = null;
     this.requestsWaiting = null;
     this.ttftP95Seconds = null;
+    this.ttftSeconds = null;
     this.preemptionsTotal = null;
     this.e2eP95Seconds = null;
     this.itlP95Seconds = null;
+  }
+
+  /**
+   * Apply q27 (signalnine/q27 engine) Prometheus /metrics.
+   *
+   * The engine exposes the [req]-universe telemetry that was previously only
+   * in stderr logs, under q27_* series with an api= label (chat / completions /
+   * messages / responses). The probe sums across label sets, exactly like the
+   * ds4/vLLM paths: live tok/s from counter deltas so idle → 0.
+   *
+   * Semantics vs the vLLM path: prefill accounting is EXACT (per-request
+   * token counts, not vLLM's estimates) and the prefix split (computed/cached)
+   * doubles as the prefix-cache hit rate; the main prefill tile follows the
+   * ds4 convention and counts COMPUTED tokens only. The waiting tile stays
+   * null → the panel shows "—" (q27 FIFO-queues, no scheduler wait), while
+   * preemptions are exposed as a constant-0 counter so Preempts reads 0.
+   * @param {string} txt
+   * @param {number} dtSec
+   */
+  _applyQ27Metrics(txt, dtSec) {
+    // Live processed counters first (move during generation -> real-time
+    // tok/s); fall back to the completion-based per-api totals for older
+    // q27 binaries (step function: 0 during generation, jump at completion).
+    const decoded =
+      this._getPromMetric(txt, "q27_decode_tokens_processed_total") ??
+      this._getPromMetric(txt, "q27_decode_tokens_total");
+    // Exact prefill (not estimated like vLLM). Follow the ds4 convention:
+    // the main prefill tile counts COMPUTED tokens only -- cache-served
+    // tokens go to the cached/uncached split below, so a cache hit does not
+    // inflate the "real work" rate.
+    const computed =
+      this._getPromMetric(txt, "q27_prefill_computed_tokens_processed_total") ??
+      this._getPromMetric(txt, "q27_prefill_computed_tokens_total");
+    if (decoded != null) {
+      if (dtSec > 0 && dtSec < 10) {
+        const deltaOut = decoded - this.lastTokenCounts.output;
+        this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
+        if (computed != null) {
+          const deltaIn = computed - this.lastTokenCounts.input;
+          this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+        }
+      }
+      if (computed != null) this.lastTokenCounts.input = computed;
+      this.lastTokenCounts.output = decoded;
+      this.totalOutputTokens = decoded;
+      // q27's prefill counter is computed-only; the token ledger wants the
+      // full prompt (computed + cached).
+      const cachedTok =
+        this._getPromMetric(txt, "q27_prefill_cached_tokens_processed_total") ??
+        this._getPromMetric(txt, "q27_prefill_cached_tokens_total");
+      if (computed != null) {
+        this.totalPromptTokens = cachedTok != null ? computed + cachedTok : computed;
+      }
+      if (cachedTok != null) this.totalCachedTokens = cachedTok;
+    }
+
+    const inflight = this._getPromMetric(txt, "q27_requests_inflight");
+    this.requestsRunning = inflight;
+    if (inflight != null) this.slotsActive = Math.round(inflight);
+
+    const slotsTotal = this._getPromMetric(txt, "q27_slots_total");
+    if (slotsTotal != null) this.slotsTotal = Math.round(slotsTotal);
+
+    this.kvCacheUsage = this._getPromMetric(txt, "q27_kv_usage_perc");
+    this.requestsWaiting = null; // not exposed: q27 FIFO-queues, no wait gauge
+    // q27 never preempts (FIFO admission) — the server exposes a constant-0
+    // counter, so the Preempts tile reads 0 instead of "—".
+    this.preemptionsTotal = this._getPromMetric(txt, "q27_preemptions_total");
+    // Engine state: q27 keeps weights resident and is ready whenever the
+    // server is up (no sleep state / memory release), so report Active like
+    // the SGLang path does.
+    if (this.gpuMemoryUtilization == null) this.gpuMemoryUtilization = 1;
+
+    // Histograms (cumulative buckets, +Inf == _count by construction).
+    const ttftHist = this._parseHistogram(
+      txt,
+      "q27_ttft_seconds",
+      "q27_ttft_seconds_count"
+    );
+    const ttftP95 = this._histogramQuantile(ttftHist.buckets, ttftHist.total, 0.95);
+    this.ttftP95Seconds = ttftP95 == null ? null : Math.round(ttftP95 * 1000) / 1000;
+
+    const e2eHist = this._parseHistogram(
+      txt,
+      "q27_e2e_seconds",
+      "q27_e2e_seconds_count"
+    );
+    const e2eP95 = this._histogramQuantile(e2eHist.buckets, e2eHist.total, 0.95);
+    this.e2eP95Seconds = e2eP95 == null ? null : Math.round(e2eP95 * 1000) / 1000;
+
+    const itlHist = this._parseHistogram(
+      txt,
+      "q27_itl_seconds",
+      "q27_itl_seconds_count"
+    );
+    const itlP95 = this._histogramQuantile(itlHist.buckets, itlHist.total, 0.95);
+    this.itlP95Seconds = itlP95 == null ? null : Math.round(itlP95 * 1000) / 1000;
+
+    // Prefix-cache hit rate + live cached/uncached prefill split (live
+    // processed counters, with completion-based fallback).
+    const cachedSplit =
+      this._getPromMetric(txt, "q27_prefill_cached_tokens_processed_total") ??
+      this._getPromMetric(txt, "q27_prefill_cached_tokens_total");
+    const computedSplit =
+      this._getPromMetric(txt, "q27_prefill_computed_tokens_processed_total") ??
+      this._getPromMetric(txt, "q27_prefill_computed_tokens_total");
+    this._setPrefillSplitRates(cachedSplit, computedSplit, dtSec);
+
+    const specAccept = this._getPromMetric(txt, "q27_spec_accept_ratio");
+    this.mtpAcceptanceRate =
+      specAccept != null ? Math.round(specAccept * 10000) / 10000 : null;
+  }
+
+  /**
+   * Apply EXL3 tools/serve_openai.py GET /health.
+   * Live tok/s from cumulative counter diffs so idle → 0.
+   * @param {Record<string, unknown>} data
+   * @param {number} dtSec
+   */
+  _applyExl3Health(data, dtSec) {
+    const prompt = Number(data?.prompt_tokens_total);
+    const completion = Number(data?.completion_tokens_total);
+    const busy = data?.busy === true;
+    const ctx = Number(data?.context_length);
+    if (Number.isFinite(ctx) && ctx > 0) this.contextLength = Math.round(ctx);
+
+    this.requestsRunning = busy ? 1 : 0;
+    this.slotsActive = busy ? 1 : 0;
+    this.slotsTotal = 1;
+    this.kvCacheUsage = null;
+    this.requestsWaiting = null;
+    this.ttftP95Seconds = null;
+    this.ttftSeconds = null;
+    this.preemptionsTotal = null;
+    this.prefixCacheHitRate = null;
+    this.e2eP95Seconds = null;
+    this.itlP95Seconds = null;
+    this.mtpAcceptanceRate = null;
+    this.cachedPrefillTps = null;
+    this.uncachedPrefillTps = null;
+
+    if (!Number.isFinite(completion)) {
+      this.generationTps = busy ? this.generationTps : 0;
+      if (!busy) this.prefillTps = 0;
+      return;
+    }
+
+    if (dtSec > 0 && dtSec < 10) {
+      const deltaOut = completion - this.lastTokenCounts.output;
+      this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
+      if (Number.isFinite(prompt)) {
+        const deltaIn = prompt - this.lastTokenCounts.input;
+        this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+      } else if (!busy && this.generationTps <= 0) {
+        this.prefillTps = 0;
+      }
+    } else if (!busy) {
+      this.generationTps = 0;
+      this.prefillTps = 0;
+    }
+
+    if (Number.isFinite(prompt)) this.lastTokenCounts.input = prompt;
+    this.lastTokenCounts.output = completion;
+    this.totalOutputTokens = completion;
+    if (Number.isFinite(prompt)) this.totalPromptTokens = prompt;
+  }
+
+  /**
+   * Apply TensorFold GET /health. Same counter contract as EXL3 (`prompt_tokens_total`,
+   * `completion_tokens_total`, optional `busy` / `context_length`). The MLX server's
+   * `max_batch_size` sizes the slot tile; the CUDA server's `{ok: true}` has no counters,
+   * so rates read 0 instead of a made-up number.
+   * @param {Record<string, unknown> | null} data
+   * @param {number} dtSec
+   */
+  _applyTensorFoldHealth(data, dtSec) {
+    const health = data && typeof data === "object" && !Array.isArray(data) ? data : {};
+    this._applyExl3Health(health, dtSec);
+    // TensorFold 0.5.0 (cuda/health.py) publishes cumulative cached prompt tokens
+    // alongside the EXL3-style counters; older builds omit it (stays null).
+    const cached = Number(health.cached_tokens_total);
+    if (Number.isFinite(cached) && cached >= 0) this.totalCachedTokens = cached;
+    const batch = Number(health.max_batch_size);
+    if (Number.isFinite(batch) && batch > 0) this.slotsTotal = Math.round(batch);
   }
 
   /**
@@ -583,7 +927,12 @@ export class LlmProbe {
       this.lastTokenCounts.input = promptTokens;
       this.lastTokenCounts.output = genTokens;
       this.totalOutputTokens = genTokens;
-      this.totalPrefillTokens = promptTokens;
+      this.totalPromptTokens = promptTokens;
+      // vLLM prefix-cache counters are token-granular (queries += prompt
+      // tokens/request, hits += tokens served from cache), so cached_tokens
+      // is directly the cumulative cached share of the prompt.
+      const cachedTok = this._getVllmMetric(txt, "prefix_cache_hits_total");
+      if (cachedTok != null) this.totalCachedTokens = cachedTok;
       const ttftSum = this._getVllmMetric(txt, "time_to_first_token_seconds_sum");
       const deltaIter =
         iterSum != null && this.lastIterSum != null ? iterSum - this.lastIterSum : 0;
@@ -608,6 +957,22 @@ export class LlmProbe {
           0,
           Math.round((livePrefill > 0 ? livePrefill : finishedPrefill) * 100) / 100
         );
+      }
+      // Live mean TTFT over the last poll window from histogram sum/count deltas.
+      // Computed BEFORE lastTtftSum is advanced so the delta is real, not 0.
+      const ttftCount = this._getVllmMetric(txt, "time_to_first_token_seconds_count");
+      if (ttftCount != null) {
+        const deltaSum =
+          ttftSum != null && this.lastTtftSum != null ? ttftSum - this.lastTtftSum : null;
+        const deltaCount =
+          this.lastTtftCount != null ? ttftCount - this.lastTtftCount : null;
+        this.ttftSeconds =
+          deltaSum != null && deltaCount != null && deltaCount > 0 && deltaSum >= 0
+            ? Math.round((deltaSum / deltaCount) * 1000) / 1000
+            : null;
+        this.lastTtftCount = ttftCount;
+      } else {
+        this.ttftSeconds = null;
       }
       if (ttftSum != null) this.lastTtftSum = ttftSum;
     }
@@ -644,18 +1009,6 @@ export class LlmProbe {
         ? Math.round((prefixHits / prefixQueries) * 10000) / 10000
         : null;
 
-    // vLLM does not expose a cached/uncached prefill token split directly.
-    // Estimate it from the cumulative prefix-cache hit rate: hits ≈ prompt
-    // tokens served from cache, the rest were computed on GPU.
-    if (this.prefixCacheHitRate != null && promptTokens != null) {
-      const cachedEst = Math.round(promptTokens * this.prefixCacheHitRate);
-      this.totalCachedPrefillTokens = cachedEst;
-      this.totalUncachedPrefillTokens = Math.max(0, promptTokens - cachedEst);
-    } else {
-      this.totalCachedPrefillTokens = null;
-      this.totalUncachedPrefillTokens = null;
-    }
-
     const mtpAccepted = this._getVllmMetric(txt, "spec_decode_num_accepted_tokens_total");
     const mtpDrafted = this._getVllmMetric(txt, "spec_decode_num_draft_tokens_total");
     this.mtpAcceptanceRate =
@@ -665,7 +1018,7 @@ export class LlmProbe {
   }
 
   /**
-   * Apply SGLang /get_server_info.
+   * Apply SGLang /server_info (or deprecated /get_server_info).
    * Older builds expose total_input_tokens / total_output_tokens.
    * Current builds (metrics often off) expose sticky last_gen_throughput under
    * internal_states[i]. Only treat it as live after the value changes between
@@ -700,6 +1053,10 @@ export class LlmProbe {
 
     const inTok = sgData.total_input_tokens;
     const outTok = sgData.total_output_tokens;
+    // Newer SGLang builds expose total_cached_tokens (radix/prefix cache
+    // served) next to the totals; older ones fall back to Prometheus.
+    const cachedNum = Number(sgData.total_cached_tokens);
+    const sgCached = Number.isFinite(cachedNum) && cachedNum >= 0 ? cachedNum : null;
     if (inTok != null && outTok != null) {
       const input = Number(inTok);
       const output = Number(outTok);
@@ -709,7 +1066,10 @@ export class LlmProbe {
         this.lastTokenCounts.input = input;
         this.lastTokenCounts.output = output;
         this.totalOutputTokens = output;
-        this.totalPrefillTokens = input;
+        this.totalPromptTokens = input;
+        if (sgCached != null) this.totalCachedTokens = sgCached;
+        this._sglangTotalsPolled = true;
+        this._sglangTokenSource = "server_info";
         if (dtSec > 0 && dtSec < 10) {
           this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
           this._setPrefillTps(deltaIn / dtSec, deltaOut > 0);
@@ -718,19 +1078,110 @@ export class LlmProbe {
       }
     }
 
-    // No cumulative counters — sticky last_gen_throughput only while it moves
+    // No cumulative counters — sticky last_gen_throughput only while it moves,
+    // unless /v1/loads (or /get_load) says requests are in flight.
     const lastGen = LlmProbe._sglangLastGenThroughput(sgData);
-    this.generationTps = this._sglangStickyThroughput(lastGen);
+    this.generationTps = this._sglangStickyThroughput(lastGen, this._sglangInflight());
+  }
+
+  /** True when SGLang load probe reported running or waiting requests. */
+  _sglangInflight() {
+    return (
+      this.slotsActive > 0 ||
+      (this.requestsRunning != null && this.requestsRunning > 0) ||
+      (this.requestsWaiting != null && this.requestsWaiting > 0)
+    );
+  }
+
+  /**
+   * Prefer /v1/loads (num_running_reqs). Fall back to /get_load, where
+   * num_reqs is running + waiting.
+   */
+  async _probeSglangLoad() {
+    this._sglangLoadGenTps = null;
+    for (const path of ["/v1/loads", "/get_load"]) {
+      try {
+        const res = await this._fetch(`${this.baseUrl}${path}`);
+        if (!res.ok) continue;
+        const data = await res.json().catch(() => null);
+        if (this._applySglangLoad(data)) return;
+      } catch {
+        /* try next */
+      }
+    }
+  }
+
+  /**
+   * Apply SGLang /v1/loads or /get_load. Returns true when a row was applied.
+   * @param {unknown} payload
+   * @returns {boolean}
+   */
+  _applySglangLoad(payload) {
+    const rows = LlmProbe._sglangLoadRows(payload);
+    if (!rows.length) return false;
+    let running = 0;
+    let waiting = 0;
+    let saw = false;
+    let loadGen = null;
+    for (const row of rows) {
+      const gen = Number(row.gen_throughput);
+      if (Number.isFinite(gen) && gen >= 0) {
+        loadGen = loadGen == null ? gen : Math.max(loadGen, gen);
+      }
+      const wait = Number(row.num_waiting_reqs);
+      const runDirect = Number(row.num_running_reqs);
+      const total = Number(row.num_reqs);
+      if (Number.isFinite(wait) && wait >= 0) {
+        waiting += wait;
+        saw = true;
+      }
+      if (Number.isFinite(runDirect) && runDirect >= 0) {
+        running += runDirect;
+        saw = true;
+      } else if (Number.isFinite(total) && total >= 0) {
+        const waitPart = Number.isFinite(wait) && wait >= 0 ? wait : 0;
+        running += Math.max(0, total - waitPart);
+        saw = true;
+      }
+    }
+    if (!saw) return false;
+    this._sglangLoadGenTps = loadGen;
+    this.requestsRunning = running;
+    this.requestsWaiting = waiting;
+    this.slotsActive = Math.round(running);
+    return true;
+  }
+
+  /**
+   * @param {unknown} payload
+   * @returns {Array<Record<string, unknown>>}
+   */
+  static _sglangLoadRows(payload) {
+    if (payload == null) return [];
+    if (Array.isArray(payload)) {
+      return payload.filter((row) => row && typeof row === "object");
+    }
+    if (typeof payload !== "object") return [];
+    if (Array.isArray(payload.loads)) {
+      return payload.loads.filter((row) => row && typeof row === "object");
+    }
+    if (payload.num_reqs != null || payload.num_running_reqs != null) {
+      return [payload];
+    }
+    return [];
   }
 
   /**
    * Map SGLang's sticky last_gen_throughput gauge to a live panel rate.
    * Returns 0 until the value changes between polls (avoids showing a stale
    * leftover after idle); stays live for a short window after each change.
+   * When `inflight` is true (independent load signal), keep a positive rate
+   * even if the gauge is not moving — a busy decode can report a constant value.
    * @param {number | null} raw
+   * @param {boolean} [inflight]
    * @returns {number}
    */
-  _sglangStickyThroughput(raw) {
+  _sglangStickyThroughput(raw, inflight = false) {
     if (raw == null || !Number.isFinite(raw) || raw < 0) {
       this._sglangStickyTps = null;
       return 0;
@@ -740,9 +1191,12 @@ export class LlmProbe {
     const prev = this._sglangStickyTps;
 
     if (!prev) {
-      // First sample after reset/start — seed only; do not display stale gauge
-      this._sglangStickyTps = { value: rounded, liveUntil: 0 };
-      return 0;
+      // First sample after reset/start — seed only unless load says we are busy
+      this._sglangStickyTps = {
+        value: rounded,
+        liveUntil: inflight && rounded > 0 ? now + SGLANG_STICKY_TPS_LIVE_MS : 0,
+      };
+      return inflight && rounded > 0 ? rounded : 0;
     }
 
     if (rounded !== prev.value) {
@@ -754,6 +1208,9 @@ export class LlmProbe {
     }
 
     if (prev.liveUntil > now) {
+      return rounded;
+    }
+    if (inflight && rounded > 0) {
       return rounded;
     }
     return 0;
@@ -791,6 +1248,46 @@ export class LlmProbe {
   }
 
   /**
+   * Live decode tok/s. Current SGLang builds publish gen_throughput while a
+   * request runs, and only then add the whole completion to
+   * generation_tokens_total. Differencing that counter stays at 0 for the
+   * whole decode and spikes once when the request ends.
+   * Max, not sum: tensor-parallel ranks repeat the same gauge.
+   * @param {string} txt
+   * @returns {number | null}
+   */
+  _sglangGenGauge(txt) {
+    const prom =
+      this._getPromMetricMax(txt, "sglang:gen_throughput") ??
+      this._getPromMetricMax(txt, "sglang_gen_throughput");
+    if (prom != null) return prom;
+    return this._sglangLoadGenTps;
+  }
+
+  /**
+   * Cumulative prefill tokens that actually did compute (cache misses).
+   * Prefers the per-mode counters; falls back to prompt − cached when only the
+   * plain prompt counter exists. Kept separate from prompt_tokens_total, which
+   * also counts cache-served tokens (the bulk of a warm session).
+   * @param {string} txt
+   * @returns {number | null}
+   */
+  _sglangPrefillComputeTokens(txt) {
+    const direct =
+      this._getPromMetricLabeled(txt, "sglang:realtime_tokens_total", "mode", "prefill_compute") ??
+      this._getPromMetricLabeled(txt, "sglang_realtime_tokens_total", "mode", "prefill_compute") ??
+      this._getPromMetricLabeled(txt, "sglang:prefill_effective_tokens_total", "mode", "input") ??
+      this._getPromMetricLabeled(txt, "sglang_prefill_effective_tokens_total", "mode", "input");
+    if (direct != null) return direct;
+    const prompt =
+      this._getPromMetric(txt, "sglang:prompt_tokens_total") ??
+      this._getPromMetric(txt, "sglang_prompt_tokens_total");
+    const cached = this._sglangCachedTokens(txt);
+    if (prompt != null && cached != null) return Math.max(0, prompt - cached);
+    return null;
+  }
+
+  /**
    * Apply SGLang Prometheus /metrics (--enable-metrics).
    * Supports both `sglang:` and `sglang_` prefixes.
    * @param {string} txt
@@ -803,31 +1300,6 @@ export class LlmProbe {
     const prompt =
       this._getPromMetric(txt, "sglang:prompt_tokens_total") ??
       this._getPromMetric(txt, "sglang_prompt_tokens_total");
-    if (gen == null) {
-      const gauge =
-        this._getPromMetric(txt, "sglang:gen_throughput") ??
-        this._getPromMetric(txt, "sglang_gen_throughput");
-      if (gauge != null) {
-        this.generationTps = Math.max(0, Math.round(gauge * 100) / 100);
-      }
-      return;
-    }
-
-    if (dtSec > 0 && dtSec < 10) {
-      const deltaOut = gen - this.lastTokenCounts.output;
-      this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
-      if (prompt != null) {
-        const deltaIn = prompt - this.lastTokenCounts.input;
-        this._setPrefillTps(deltaIn / dtSec, deltaOut > 0);
-        this.lastTokenCounts.input = prompt;
-        this.totalPrefillTokens = prompt;
-      } else if (deltaOut <= 0) {
-        this.prefillTps = 0;
-      }
-    }
-    this.lastTokenCounts.output = gen;
-    this.totalOutputTokens = gen;
-
     const running =
       this._getPromMetric(txt, "sglang:num_running_reqs") ??
       this._getPromMetric(txt, "sglang_num_running_reqs");
@@ -835,10 +1307,73 @@ export class LlmProbe {
       this.requestsRunning = running;
       this.slotsActive = Math.round(running);
     }
+    if (gen == null) {
+      const gauge = this._sglangGenGauge(txt);
+      if (gauge != null) {
+        this.generationTps = Math.max(0, Math.round(gauge * 100) / 100);
+      }
+      return;
+    }
 
+    // Prefill accounting: the tile counts every prompt token taken in this
+    // window — cache-served + computed — and the split rows below break it
+    // down. The per-mode counters are exact; prompt_tokens_total alone cannot
+    // tell the two apart (it also folds in host/storage hits), so it is the
+    // fallback for builds without the realtime series.
+    const prefillCompute = this._sglangPrefillComputeTokens(txt);
     const cached = this._sglangCachedTokens(txt);
-    if (cached != null && prompt != null) {
-      this._setPrefillSplitRates(cached, prompt, dtSec);
+
+    // Difference only against our own baseline; after a server-info hand-off
+    // the first sample seeds instead of reporting the gap between two series.
+    const ownsBaseline = this._sglangTokenSource !== "server_info";
+    const canDiff = ownsBaseline && dtSec > 0 && dtSec < 10;
+    if (canDiff) {
+      const deltaOut = gen - this.lastTokenCounts.output;
+      const gauge = this._sglangGenGauge(txt);
+      const busy = (running != null && running > 0) || this._sglangInflight();
+      if (gauge != null && busy) {
+        this.generationTps = Math.max(0, Math.round(gauge * 100) / 100);
+      } else if (gauge != null) {
+        // Idle, or the completion just landed in the counter. The gauge already
+        // carried the live rate; the counter jump is not another tok/s sample.
+        this.generationTps = 0;
+      } else {
+        this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
+      }
+      if (prefillCompute == null && prompt != null) {
+        // No per-mode counters: the prompt counter is the only total we have.
+        const deltaIn = prompt - this.lastTokenCounts.input;
+        this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+      } else if (prefillCompute == null && deltaOut <= 0) {
+        this.prefillTps = 0;
+      }
+    }
+    // Seed outside the rate window too: on the first poll after a restart the
+    // window is unusable, and a stale 0 baseline would turn the engine's
+    // lifetime prompt counter into a rate on the next poll (#99).
+    this.lastTokenCounts.output = gen;
+    if (prompt != null) this.lastTokenCounts.input = prompt;
+    this._sglangTokenSource = "prometheus";
+    this.totalOutputTokens = gen;
+    this.totalPromptTokens = prompt ?? null;
+    // Cached share from the same exposition (device layer preferred).
+    const cachedNow = this._sglangCachedTokens(txt);
+    if (cachedNow != null) this.totalCachedTokens = cachedNow;
+
+    // The tile reads cache-served + computed; the split rows below show the
+    // two parts. Poll-window rates, not latches: a window that prefilled
+    // nothing reads 0 even while unrelated requests are still decoding
+    // (holding the last value here kept a stale number on screen for hours).
+    if (prefillCompute != null && cached != null) {
+      this._setPrefillSplitRates(cached, prefillCompute, dtSec);
+      if (
+        canDiff &&
+        this.uncachedPrefillTps != null &&
+        this.cachedPrefillTps != null
+      ) {
+        const total = this.uncachedPrefillTps + this.cachedPrefillTps;
+        this.prefillTps = Math.max(0, Math.round(total * 100) / 100);
+      }
     }
   }
 
@@ -847,18 +1382,18 @@ export class LlmProbe {
    * Prefers cache_source="device" so HiCache L1/L2/L3 labels are not summed.
    */
   _applySglangPrefillSplit(txt, dtSec) {
-    const prompt =
-      this._getPromMetric(txt, "sglang:prompt_tokens_total") ??
-      this._getPromMetric(txt, "sglang_prompt_tokens_total");
+    const compute = this._sglangPrefillComputeTokens(txt);
     const cached = this._sglangCachedTokens(txt);
-    if (prompt != null) this.totalPrefillTokens = prompt;
-    if (cached != null && prompt != null) {
-      this._setPrefillSplitRates(cached, prompt, dtSec);
+    if (cached != null) this.totalCachedTokens = cached;
+    if (compute != null && cached != null) {
+      this._setPrefillSplitRates(cached, compute, dtSec);
     }
   }
 
   _sglangCachedTokens(txt) {
     return (
+      this._getPromMetricLabeled(txt, "sglang:realtime_tokens_total", "mode", "prefill_cache") ??
+      this._getPromMetricLabeled(txt, "sglang_realtime_tokens_total", "mode", "prefill_cache") ??
       this._getPromMetricLabeled(txt, "sglang:cached_tokens_total", "cache_source", "device") ??
       this._getPromMetricLabeled(txt, "sglang_cached_tokens_total", "cache_source", "device") ??
       this._getPromMetricMax(txt, "sglang:cached_tokens_total") ??
@@ -866,9 +1401,9 @@ export class LlmProbe {
     );
   }
 
-  /** Prefer SGLang /get_model_info (or /model_info) over raw HF cache paths. */
+  /** Prefer SGLang /model_info (or deprecated /get_model_info) over raw HF cache paths. */
   async _enrichSglangModelInfo() {
-    for (const path of ["/get_model_info", "/model_info"]) {
+    for (const path of SGLANG_MODEL_INFO_PATHS) {
       try {
         const res = await this._fetch(`${this.baseUrl}${path}`);
         if (!res.ok) continue;
@@ -934,7 +1469,8 @@ export class LlmProbe {
           }
 
           this.totalOutputTokens = totalDecoded;
-          this.totalPrefillTokens = promptedSum;
+          this.totalPromptTokens = promptedSum;
+          if (sawCache) this.totalCachedTokens = cachedSum;
           this.generationTps = Math.max(0, Math.round(totalGen * 100) / 100);
           this._setPrefillTps(totalPrefill, totalGen > 0);
           if (sawCache) this._setPrefillSplitRates(cachedSum, promptedSum, dtSec);
@@ -1041,11 +1577,12 @@ export class LlmProbe {
   }
 
   /**
-   * Parse a vLLM Prometheus histogram from /metrics text.
-   * Returns { buckets: [{upper, count}], total } with cumulative counts per `le`,
-   * summed across label sets. `total` is the summed `_count` series (or null).
+   * Parse a Prometheus histogram from /metrics text.
+   * Returns { buckets: [{upper, count}], total } with cumulative counts per
+   * `le`, summed across label sets. `total` is the summed `_count` series
+   * (or null). `countMetricName` is the full metric name (with prefix).
    */
-  _parseVllmHistogram(body, metricPrefix) {
+  _parseHistogram(body, metricPrefix, countMetricName) {
     const esc = metricPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     // Bucket lines: <metricPrefix>_bucket{...le="X"...} VALUE
     const bucketRe = new RegExp(
@@ -1064,7 +1601,7 @@ export class LlmProbe {
       if (upper === Infinity) infCount += count;
       byUpper.set(upper, (byUpper.get(upper) || 0) + count);
     }
-    const total = this._getVllmMetric(body, `${metricPrefix.replace(/^vllm:/, "")}_count`);
+    const total = this._getPromMetric(body, countMetricName);
     // Prometheus invariant: +Inf bucket count == _count. Mismatch → refuse quantile.
     if (total != null && infCount > 0 && Math.abs(infCount - total) > 1e-6) {
       return { buckets: [], total: null };
@@ -1072,6 +1609,14 @@ export class LlmProbe {
     const buckets = Array.from(byUpper, ([upper, count]) => ({ upper, count }));
     buckets.sort((a, b) => a.upper - b.upper);
     return { buckets, total };
+  }
+
+  /**
+   * Parse a vLLM Prometheus histogram from /metrics text (vllm: prefix).
+   */
+  _parseVllmHistogram(body, metricPrefix) {
+    const name = metricPrefix.replace(/^vllm:/, "");
+    return this._parseHistogram(body, metricPrefix, `vllm:${name}_count`);
   }
 
   /**
@@ -1199,13 +1744,13 @@ export class LlmProbe {
       cachedPrefillTps: this.cachedPrefillTps,
       uncachedPrefillTps: this.uncachedPrefillTps,
       totalOutputTokens: this.totalOutputTokens,
-      totalPrefillTokens: this.totalPrefillTokens,
-      totalCachedPrefillTokens: this.totalCachedPrefillTokens,
-      totalUncachedPrefillTokens: this.totalUncachedPrefillTokens,
+      totalPromptTokens: this.totalPromptTokens ?? null,
+      totalCachedTokens: this.totalCachedTokens ?? null,
       kvCacheUsage: this.kvCacheUsage,
       requestsRunning: this.requestsRunning,
       requestsWaiting: this.requestsWaiting,
       ttftP95Seconds: this.ttftP95Seconds,
+      ttftSeconds: this.ttftSeconds,
       preemptionsTotal: this.preemptionsTotal,
       prefixCacheHitRate: this.prefixCacheHitRate,
       e2eP95Seconds: this.e2eP95Seconds,
@@ -1231,13 +1776,12 @@ export class LlmProbe {
       cachedPrefillTps: null,
       uncachedPrefillTps: null,
       totalOutputTokens: 0,
-      totalPrefillTokens: 0,
-      totalCachedPrefillTokens: null,
-      totalUncachedPrefillTokens: null,
+      totalCachedTokens: null,
       kvCacheUsage: null,
       requestsRunning: null,
       requestsWaiting: null,
       ttftP95Seconds: null,
+      ttftSeconds: null,
       preemptionsTotal: null,
       prefixCacheHitRate: null,
       e2eP95Seconds: null,

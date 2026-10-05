@@ -293,7 +293,7 @@ export class LlmDailyStore {
   /**
    * @param {string} sparkId
    * @param {number} port
-   * @param {{ available?: boolean, generationTps?: number, prefillTps?: number, cachedPrefillTps?: number|null, uncachedPrefillTps?: number|null, totalOutputTokens?: number, totalPrefillTokens?: number, totalCachedPrefillTokens?: number|null, totalUncachedPrefillTokens?: number|null }} metrics
+   * @param {{ available?: boolean, generationTps?: number, prefillTps?: number, cachedPrefillTps?: number|null, uncachedPrefillTps?: number|null, totalOutputTokens?: number, totalPromptTokens?: number|null, totalCachedTokens?: number|null }} metrics
    * @param {Date} [now]
    */
   record(sparkId, port, metrics, now = new Date()) {
@@ -339,14 +339,21 @@ export class LlmDailyStore {
    * @returns {boolean} true when any tokens were added
    */
   _ingestTokenTotals(key, entry, hourKey, metrics, nowMs) {
+    const prompt = metrics.totalPromptTokens;
+    const cached = metrics.totalCachedTokens;
     const cur = {
       out: metrics.totalOutputTokens,
-      pref: metrics.totalPrefillTokens,
-      cached: metrics.totalCachedPrefillTokens,
-      uncached: metrics.totalUncachedPrefillTokens,
+      pref: prompt,
+      cached,
+      // Upstream probes expose the full prompt total plus the cached share; the
+      // uncached/computed part is the remainder (only meaningful when split).
+      uncached:
+        prompt != null && cached != null && Number.isFinite(prompt) && Number.isFinite(cached)
+          ? prompt - cached
+          : null,
     };
     const last = this._lastTokens[key];
-    const readable = Number.isFinite(cur.out) && Number.isFinite(cur.pref);
+    const readable = Number.isFinite(cur.out);
     if (last == null || !readable || nowMs - last.t > GAP_MS) {
       this._lastTokens[key] = { t: nowMs, ...cur };
       return false;
